@@ -1,7 +1,7 @@
 {
-  "name": "afk",
-  "version": "0.1.0",
-  "description": "afk - Away From Keyboard toggle + Telegram approvals for Claude Code",
+  "name": "afk-claude",
+  "version": "1.0.0",
+  "description": "Remote control and approval system for Claude Code via Telegram",
   "bin": {
     "afk": "bin/afk"
   },
@@ -12,8 +12,26 @@
     "test:syntax": "node -c bin/afk"
   },
   "type": "commonjs",
-  "private": true,
-  "license": "UNLICENSED",
+  "author": "Leonid Bugaev",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/buger/afk-claude.git"
+  },
+  "bugs": {
+    "url": "https://github.com/buger/afk-claude/issues"
+  },
+  "homepage": "https://github.com/buger/afk-claude#readme",
+  "keywords": [
+    "claude",
+    "claude-code",
+    "telegram",
+    "bot",
+    "remote-control",
+    "approval",
+    "afk",
+    "cli"
+  ],
   "engines": {
     "node": ">=18"
   }

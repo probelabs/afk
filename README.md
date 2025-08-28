@@ -1,6 +1,37 @@
-# afk (Node)
+# afk - Claude Code Remote Control via Telegram
 
-AFK toggle + Telegram approvals for Claude Code with a single, scope‑aware CLI. Zero runtime dependencies (Node ≥ 18 built‑ins).
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Node Version](https://img.shields.io/badge/node-%E2%89%A518-brightgreen.svg)](https://nodejs.org/)
+[![Zero Dependencies](https://img.shields.io/badge/dependencies-0-blue.svg)](package.json)
+
+**afk** (Away From Keyboard) is a powerful CLI tool that enables remote control and approval workflows for Claude Code through Telegram. Perfect for when you want to monitor and control Claude's actions while away from your desk.
+
+## 🎯 Key Features
+
+- **🔐 Remote Approval System**: Approve or deny Claude's tool usage remotely via Telegram
+- **🔄 AFK Toggle**: Simple CLI commands to switch between local and remote modes
+- **📱 Telegram Integration**: Real-time notifications and interactive approval buttons
+- **🎭 Multi-Session Support**: Handle multiple Claude sessions simultaneously
+- **📦 Zero Dependencies**: Built entirely with Node.js ≥18 built-ins
+- **🔌 Flexible Installation**: User, project, or local scope installation options
+- **📬 Local Inbox**: Optional blocking Stop flows for enhanced control
+
+## 📋 Table of Contents
+
+- [Requirements](#requirements)
+- [Quick Start](#quick-start)
+- [Installation](#installation)
+- [Configuration](#configuration)
+- [Usage](#usage)
+- [Commands](#commands)
+- [Architecture](#architecture)
+- [Testing](#testing)
+- [Contributing](#contributing)
+- [License](#license)
+
+## 🚀 How It Works
+
+afk acts as a bridge between Claude Code and Telegram, intercepting tool usage requests and forwarding them to your Telegram bot for approval when in "remote" mode.
 
 - Manual AFK: `/afk on|off|toggle|status` via a deterministic UserPromptSubmit hook (blocks the prompt; updates state).
 - PreToolUse: Gates permissioned tools with Telegram Approve/Deny when AFK=remote, before Claude’s normal permission UI.
@@ -9,23 +40,46 @@ AFK toggle + Telegram approvals for Claude Code with a single, scope‑aware CLI
 - Multi‑session: Each Telegram message is mapped to a session; plain messages target the latest session by default.
 - Local inbox: `inbox wait` enables optional blocking Stop flows.
 
-## Requirements
+## 📦 Requirements
 
 - Node.js ≥ 18
 - A Telegram bot token (from @BotFather) and your Telegram user chat ID
 - Claude Code (to install/approve hooks under `/hooks`)
 
-## Quick Start
+## 🏁 Quick Start
 
-1) Put `afk` on your PATH (or run directly):
+### 1️⃣ Install the CLI
 
-```
+#### Option A: Clone from GitHub
+```bash
+# Clone the repository
+git clone https://github.com/buger/afk-claude.git
+cd afk-claude
+
+# Make the binary executable
+chmod +x bin/afk
+
+# Add to PATH (choose one):
+# Option 1: Copy to local bin
 mkdir -p ~/.claude-remote/bin
 cp bin/afk ~/.claude-remote/bin/afk
-chmod +x ~/.claude-remote/bin/afk
+export PATH="$HOME/.claude-remote/bin:$PATH"  # Add to ~/.bashrc or ~/.zshrc
+
+# Option 2: Create symlink
+ln -s "$(pwd)/bin/afk" /usr/local/bin/afk
 ```
 
-2) Guided setup (recommended):
+#### Option B: Direct Download
+```bash
+# Download directly from GitHub
+curl -L https://raw.githubusercontent.com/buger/afk-claude/main/bin/afk -o ~/.claude-remote/bin/afk
+chmod +x ~/.claude-remote/bin/afk
+export PATH="$HOME/.claude-remote/bin:$PATH"
+```
+
+### 2️⃣ Run Guided Setup
+
+The interactive setup wizard will help you configure everything:
 
 ```
 afk setup
@@ -33,7 +87,9 @@ afk setup
 
 The wizard asks for your Telegram bot token (masked), verifies it, guides you to message the bot, auto‑detects your chat ID, writes `~/.claude-remote/config.json`, and sends a test message.
 
-3) Install hooks (prompts if flags omitted):
+### 3️⃣ Install Claude Code Hooks
+
+Choose your installation scope:
 
 ```
 afk install
@@ -43,9 +99,13 @@ afk install --scope project --project-root /path/to/repo
 afk install --scope local   --project-root /path/to/repo
 ```
 
-4) Approve hooks (one time after changes): open Claude Code → run `/hooks` → approve entries.
+### 4️⃣ Approve Hooks in Claude Code
 
-5) Start the Telegram bot (single instance):
+Open Claude Code → run `/hooks` → approve the newly installed hooks.
+
+### 5️⃣ Start the Telegram Bot
+
+Launch the bot (runs as a single instance):
 
 ```
 afk telegram start-bot
@@ -236,4 +296,50 @@ echo '{"session_id":"sess-1","cwd":"/path/to/proj"}' | afk hook stop
 ```
 afk inbox wait --session sess-1 --timeout 120
 ```
+
+## 🧪 Testing
+
+Run the test suite to ensure everything is working correctly:
+
+```bash
+# Run all tests
+npm test
+
+# Run specific test suites
+npm run test:permissions   # Test permission handling
+npm run test:integration   # Test integration flows
+npm run test:syntax        # Verify syntax is valid
+```
+
+## 🤝 Contributing
+
+Contributions are welcome! Please read our [Contributing Guidelines](CONTRIBUTING.md) for details on:
+- Code of conduct
+- Development setup
+- Pull request process
+- Coding standards
+
+## 📝 License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+## 🙏 Acknowledgments
+
+- Built for the Claude Code community
+- Inspired by the need for better remote control of AI assistants
+- Zero dependencies philosophy for maximum portability
+
+## 📚 Resources
+
+- [Claude Code Documentation](https://docs.anthropic.com/claude-code)
+- [Telegram Bot API](https://core.telegram.org/bots/api)
+- [Node.js Built-in Modules](https://nodejs.org/api/)
+
+## 🐛 Issues & Support
+
+Found a bug or have a feature request? Please open an issue on [GitHub Issues](https://github.com/buger/afk-claude/issues).
+
+---
+
+**Made with ❤️ for the Claude Code community**
 
