@@ -1,0 +1,2928 @@
+#!/usr/bin/env node
+// afk — AFK toggle + Telegram approvals for Claude Code (Node)
+// Scope-aware installer + PreToolUse/Stop hooks with Telegram integration.
+
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const https = require('https');
+const { spawnSync } = require('child_process');
+
+// ---------------------------
+// Constants & paths
+// ---------------------------
+const HOME = os.homedir();
+const USER_CFG_DIR = path.join(HOME, '.claude-remote');
+const USER_BIN = path.join(USER_CFG_DIR, 'bin');
+const USER_CFG = path.join(USER_CFG_DIR, 'config.json');
+const APPROVAL_DIR = path.join(USER_CFG_DIR, 'approvals');
+const STATE_FILE = path.join(USER_CFG_DIR, 'mode'); // "remote" | "local"
+const SESSION_MAP_FILE = path.join(USER_CFG_DIR, 'session-map.json');
+const HISTORY_FILE = path.join(USER_CFG_DIR, 'history.jsonl');
+const MESSAGE_QUEUE_DIR = path.join(USER_CFG_DIR, 'messages');
+const GLOBAL_QUEUE_FILE = path.join(MESSAGE_QUEUE_DIR, 'global.jsonl');
+const PROCESSED_QUEUE_FILE = path.join(MESSAGE_QUEUE_DIR, 'processed.jsonl');
+const LOCKS_DIR = path.join(MESSAGE_QUEUE_DIR, 'locks');
+const USER_CLAUDE_SETTINGS = path.join(HOME, '.claude', 'settings.json');
+const DEFAULT_MODE = 'local';
+const DEFAULT_TIMEOUT = 3600; // 1 hour (in seconds)
+const DEFAULT_TIMEOUT_ACTION = 'deny'; // 'deny', 'allow', or 'wait'
+const DEBUG_LOG_FILE = path.join(USER_CFG_DIR, 'debug.log');
+const ACTIVE_SESSIONS_FILE = path.join(USER_CFG_DIR, 'active-sessions.json');
+
+// ---------------------------
+// Debug logging
+// ---------------------------
+function isDebugEnabled() {
+  // Check persistent debug setting
+  const debugFile = path.join(USER_CFG_DIR, '.debug');
+  if (fs.existsSync(debugFile)) return true;
+  
+  // Check environment variable
+  if (process.env.AFK_DEBUG === '1' || process.env.CC_REMOTE_DEBUG === '1') {
+    if (process.env.CC_REMOTE_DEBUG === '1') {
+      eprint('[afk] Warning: CC_REMOTE_DEBUG is deprecated, use AFK_DEBUG instead');
+    }
+    return true;
+  }
+  
+  // Check command line flag
+  if (process.argv.includes('--debug')) return true;
+  
+  return false;
+}
+
+const DEBUG_MODE = isDebugEnabled();
+
+function debugLog(category, message, data = null) {
+  if (!DEBUG_MODE) return;
+  
+  const timestamp = new Date().toISOString();
+  const logEntry = {
+    timestamp,
+    category,
+    message,
+    data,
+    pid: process.pid,
+    mode: readMode(),
+    session: process.env.CLAUDE_SESSION_ID || 'unknown'
+  };
+  
+  // Log to stderr for immediate visibility
+  const logLine = `[DEBUG ${timestamp}] [${category}] ${message}`;
+  if (data) {
+    eprint(logLine, JSON.stringify(data, null, 2));
+  } else {
+    eprint(logLine);
+  }
+  
+  // Also append to debug log file
+  try {
+    ensureDir(USER_CFG_DIR);
+    fs.appendFileSync(DEBUG_LOG_FILE, JSON.stringify(logEntry) + '\n');
+  } catch (e) {
+    // Silent fail - don't break the app if logging fails
+  }
+}
+
+// ---------------------------
+// Utilities
+// ---------------------------
+function eprint(...args) { console.error(...args); }
+
+function ensureDir(p) { fs.mkdirSync(p, { recursive: true }); }
+
+// ---------------------------  
+// Global message queue system
+// ---------------------------
+function initMessageQueue() {
+  ensureDir(MESSAGE_QUEUE_DIR);
+  ensureDir(LOCKS_DIR);
+  // Create empty files if they don't exist
+  if (!fs.existsSync(GLOBAL_QUEUE_FILE)) {
+    fs.writeFileSync(GLOBAL_QUEUE_FILE, '');
+  }
+  if (!fs.existsSync(PROCESSED_QUEUE_FILE)) {
+    fs.writeFileSync(PROCESSED_QUEUE_FILE, '');
+  }
+}
+
+function appendToGlobalQueue(updates) {
+  if (!updates || updates.length === 0) return;
+  
+  initMessageQueue();
+  const timestamp = new Date().toISOString();
+  
+  for (const update of updates) {
+    const entry = {
+      timestamp,
+      update_id: update.update_id,
+      update
+    };
+    fs.appendFileSync(GLOBAL_QUEUE_FILE, JSON.stringify(entry) + '\n');
+  }
+}
+
+function getProcessedUpdateIds() {
+  if (!fs.existsSync(PROCESSED_QUEUE_FILE)) return new Set();
+  
+  const processed = new Set();
+  try {
+    const content = fs.readFileSync(PROCESSED_QUEUE_FILE, 'utf8');
+    const lines = content.trim().split('\n').filter(Boolean);
+    for (const line of lines) {
+      const entry = JSON.parse(line);
+      processed.add(entry.update_id);
+    }
+  } catch (e) {
+    eprint('[queue] Error reading processed queue:', e.message);
+  }
+  return processed;
+}
+
+function markUpdateAsProcessed(updateId, processedBy) {
+  initMessageQueue();
+  const entry = {
+    timestamp: new Date().toISOString(),
+    update_id: updateId,
+    processed_by: processedBy
+  };
+  fs.appendFileSync(PROCESSED_QUEUE_FILE, JSON.stringify(entry) + '\n');
+}
+
+function getMyMessages(filterFn) {
+  if (!fs.existsSync(GLOBAL_QUEUE_FILE)) return [];
+  
+  const processed = getProcessedUpdateIds();
+  const myMessages = [];
+  
+  try {
+    const content = fs.readFileSync(GLOBAL_QUEUE_FILE, 'utf8');
+    const lines = content.trim().split('\n').filter(Boolean);
+    
+    for (const line of lines) {
+      const entry = JSON.parse(line);
+      
+      // Skip already processed messages
+      if (processed.has(entry.update_id)) continue;
+      
+      // Apply filter to see if this message is for me
+      if (filterFn(entry.update)) {
+        myMessages.push(entry);
+      }
+    }
+  } catch (e) {
+    eprint('[queue] Error reading global queue:', e.message);
+  }
+  
+  return myMessages;
+}
+
+function atomicClaimMessage(filterFn, hookId) {
+  // Use file locking to atomically claim a message
+  const lockFile = path.join(LOCKS_DIR, 'message-claim.lock');
+  
+  try {
+    ensureDir(LOCKS_DIR);
+    
+    // Try to acquire lock with timeout
+    const maxAttempts = 50; // 50ms max wait
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      try {
+        // Try to create lock file exclusively
+        fs.writeFileSync(lockFile, `${hookId}:${Date.now()}`, { flag: 'wx' });
+        break; // Lock acquired
+      } catch (e) {
+        if (e.code === 'EEXIST') {
+          // Lock exists, wait 1ms and try again (synchronous)
+          const start = Date.now();
+          while (Date.now() - start < 1) { /* busy wait 1ms */ }
+          continue;
+        }
+        throw e; // Other error
+      }
+      
+      if (attempt === maxAttempts - 1) {
+        // Couldn't acquire lock
+        return null;
+      }
+    }
+    
+    // Lock acquired, now safely find and claim message
+    const myMessages = getMyMessages(filterFn);
+    if (myMessages.length > 0) {
+      const message = myMessages[0];
+      markUpdateAsProcessed(message.update_id, hookId);
+      return message;
+    }
+    
+    return null;
+    
+  } catch (e) {
+    eprint(`[${hookId}] Error in atomic claim:`, e.message);
+    return null;
+  } finally {
+    // Always release lock
+    try {
+      if (fs.existsSync(lockFile)) {
+        fs.unlinkSync(lockFile);
+      }
+    } catch (e) {
+      // Ignore cleanup errors
+    }
+  }
+}
+
+async function distributedTelegramPoll(filterFn, hookId, timeoutMs = 21600000) {
+  eprint(`[${hookId}] Starting distributed polling...`);
+  
+  const { telegram_bot_token: token } = cfg();
+  if (!token) {
+    throw new Error('No Telegram bot token configured');
+  }
+  
+  let lastUpdateId = 0;
+  const startTime = Date.now();
+  let lastAbandonedCheck = 0;
+  
+  while (Date.now() - startTime < timeoutMs) {
+    try {
+      // Get updates with offset to avoid conflicts with other pollers
+      const updates = await tgApiWithToken(token, 'getUpdates', {
+        offset: lastUpdateId + 1,
+        limit: 10,
+        timeout: 5 // Short timeout for responsiveness
+      });
+      
+      if (updates.length > 0) {
+        // Update our last seen ID
+        lastUpdateId = Math.max(...updates.map(u => u.update_id));
+        
+        // Dump ALL messages to global queue
+        appendToGlobalQueue(updates);
+        eprint(`[${hookId}] Dumped ${updates.length} messages to global queue`);
+      }
+      
+      // Atomically claim a message for this hook
+      const claimedMessage = atomicClaimMessage(filterFn, hookId);
+      if (claimedMessage) {
+        eprint(`[${hookId}] Claimed message ${claimedMessage.update_id}`);
+        return claimedMessage.update;
+      }
+      
+      // Check for abandoned sessions every 60 seconds
+      const now = Date.now();
+      if (now - lastAbandonedCheck > 60000) {
+        const abandonedSessions = checkAbandonedSessions();
+        for (const session of abandonedSessions) {
+          await notifyAbandonedSession(session);
+          removeActiveSession(session.sessionId);
+        }
+        lastAbandonedCheck = now;
+      }
+      
+      // Brief pause to prevent hammering the API
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      
+    } catch (e) {
+      eprint(`[${hookId}] Polling error:`, e.message);
+      await new Promise(resolve => setTimeout(resolve, 2000));
+    }
+  }
+  
+  throw new Error(`[${hookId}] Polling timeout after ${timeoutMs}ms`);
+}
+
+function loadJson(p, def) {
+  try {
+    if (fs.existsSync(p)) return JSON.parse(fs.readFileSync(p, 'utf8'));
+  } catch (e) { eprint(`[afk] Failed to read ${p}: ${e.message}`); }
+  return def;
+}
+
+function saveJson(p, obj) {
+  ensureDir(path.dirname(p));
+  const tmp = p + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(obj, null, 2));
+  fs.renameSync(tmp, p);
+}
+
+// Parse compound bash commands into individual commands
+function parseCompoundCommand(command) {
+  const commands = [];
+  let current = '';
+  let inSingleQuote = false;
+  let inDoubleQuote = false;
+  let escapeNext = false;
+  let parenDepth = 0;
+  
+  // Operators that separate commands
+  const separators = ['|', '&&', '||', ';', '&'];
+  
+  for (let i = 0; i < command.length; i++) {
+    const char = command[i];
+    const nextChar = command[i + 1];
+    
+    if (escapeNext) {
+      current += char;
+      escapeNext = false;
+      continue;
+    }
+    
+    if (char === '\\') {
+      escapeNext = true;
+      current += char;
+      continue;
+    }
+    
+    if (char === "'" && !inDoubleQuote) {
+      inSingleQuote = !inSingleQuote;
+      current += char;
+      continue;
+    }
+    
+    if (char === '"' && !inSingleQuote) {
+      inDoubleQuote = !inDoubleQuote;
+      current += char;
+      continue;
+    }
+    
+    if (char === '(' && !inSingleQuote && !inDoubleQuote) {
+      parenDepth++;
+      current += char;
+      continue;
+    }
+    
+    if (char === ')' && !inSingleQuote && !inDoubleQuote) {
+      parenDepth--;
+      current += char;
+      continue;
+    }
+    
+    // Check for operators when not in quotes or parens
+    if (!inSingleQuote && !inDoubleQuote && parenDepth === 0) {
+      // Check for two-char operators
+      if ((char === '&' && nextChar === '&') || (char === '|' && nextChar === '|')) {
+        if (current.trim()) {
+          commands.push(current.trim());
+        }
+        current = '';
+        i++; // Skip next char
+        continue;
+      }
+      
+      // Check for single-char operators
+      if (separators.includes(char)) {
+        if (current.trim()) {
+          commands.push(current.trim());
+        }
+        current = '';
+        continue;
+      }
+    }
+    
+    current += char;
+  }
+  
+  if (current.trim()) {
+    commands.push(current.trim());
+  }
+  
+  return commands;
+}
+
+// Generate permission pattern for Claude settings.json
+function generatePermissionPattern(toolName, toolInput) {
+  // For Bash commands, create specific patterns
+  if (toolName === 'Bash' && toolInput.command) {
+    const cmd = toolInput.command;
+    
+    // Parse compound commands and generate patterns for each
+    const commands = parseCompoundCommand(cmd);
+    if (commands.length > 1) {
+      // For compound commands, return patterns for all parts
+      return commands.map(singleCmd => {
+        const parts = singleCmd.trim().split(/\s+/);
+        const baseCmd = parts[0];
+        
+        if (baseCmd === 'npm' && parts[1]) {
+          return `Bash(npm ${parts[1]}:*)`;
+        }
+        if (baseCmd === 'git' && parts[1]) {
+          return `Bash(git ${parts[1]}:*)`;
+        }
+        if (baseCmd === 'cargo' && parts[1]) {
+          return `Bash(cargo ${parts[1]}:*)`;
+        }
+        if (baseCmd === 'make' && parts[1]) {
+          return `Bash(make ${parts[1]}:*)`;
+        }
+        
+        return `Bash(${baseCmd}:*)`;
+      });
+    }
+    
+    // Single command
+    const parts = cmd.trim().split(/\s+/);
+    const baseCmd = parts[0];
+    
+    // Check if it's a common safe command pattern
+    if (baseCmd === 'npm' && parts[1]) {
+      return `Bash(npm ${parts[1]}:*)`;
+    }
+    if (baseCmd === 'git' && parts[1]) {
+      return `Bash(git ${parts[1]}:*)`;
+    }
+    if (baseCmd === 'cargo' && parts[1]) {
+      return `Bash(cargo ${parts[1]}:*)`;
+    }
+    if (baseCmd === 'make' && parts[1]) {
+      return `Bash(make ${parts[1]}:*)`;
+    }
+    
+    // For other commands, use baseCmd:* pattern
+    return `Bash(${baseCmd}:*)`;
+  }
+  
+  // For WebFetch, use domain pattern
+  if (toolName === 'WebFetch' && toolInput.url) {
+    try {
+      const url = new URL(toolInput.url);
+      return `WebFetch(domain:${url.hostname})`;
+    } catch {
+      return 'WebFetch(*)';
+    }
+  }
+  
+  // For file operations (Read, Edit, Write, MultiEdit), no pattern needed
+  // These tools don't use patterns in permissions
+  if (['Read', 'Edit', 'Write', 'MultiEdit'].includes(toolName)) {
+    return toolName;
+  }
+  
+  // For MCP tools, use the full tool name
+  if (toolName.startsWith('mcp__')) {
+    return toolName;
+  }
+  
+  // For other internal tools like Task, TodoWrite, etc., just use the name
+  if (['Task', 'TodoWrite', 'Glob', 'Grep', 'LS', 'NotebookEdit', 'WebSearch', 'BashOutput', 'KillBash', 'ExitPlanMode'].includes(toolName)) {
+    return toolName;
+  }
+  
+  // Default: return the tool name
+  return toolName;
+}
+
+// Check if a pattern matches a permission rule
+function patternMatches(pattern, rule) {
+  // Exact match
+  if (pattern === rule) return true;
+  
+  // For tools without patterns (Read, Edit, etc.), just check tool name
+  if (!rule.includes('(') && !pattern.includes('(')) {
+    return pattern === rule;
+  }
+  
+  // Check if rule is more general (e.g., Bash(*) matches any Bash command)
+  if (rule.endsWith('(*)') || rule.endsWith('(**)')) {
+    const rulePrefix = rule.split('(')[0];
+    const patternPrefix = pattern.split('(')[0];
+    return rulePrefix === patternPrefix;
+  }
+  
+  // Check wildcard patterns like Bash(npm:*) matching Bash(npm test:*)
+  if (rule.includes(':*') && pattern.includes(':')) {
+    const ruleBase = rule.replace(':*)', '');
+    const patternBase = pattern.substring(0, pattern.indexOf(':'));
+    return pattern.startsWith(ruleBase);
+  }
+  
+  return false;
+}
+
+// Check Claude's permission settings at all levels
+function checkClaudePermissions(toolName, toolInput, cwd) {
+  const pattern = generatePermissionPattern(toolName, toolInput);
+  
+  debugLog('PERMISSION_CHECK', 'Checking Claude permissions', {
+    toolName,
+    pattern,
+    cwd
+  });
+  
+  // Check three levels: local → project → user
+  // Local settings override project, project overrides user
+  const levels = [];
+  
+  // Determine if we're in a project
+  if (cwd) {
+    // Look for .claude directory up the tree
+    let currentDir = cwd;
+    while (currentDir !== '/' && currentDir !== path.dirname(currentDir)) {
+      const claudeDir = path.join(currentDir, '.claude');
+      if (fs.existsSync(claudeDir)) {
+        // Found project root
+        levels.push({
+          name: 'local',
+          path: path.join(claudeDir, 'settings.local.json')
+        });
+        levels.push({
+          name: 'project', 
+          path: path.join(claudeDir, 'settings.json')
+        });
+        break;
+      }
+      currentDir = path.dirname(currentDir);
+    }
+  }
+  
+  // Always check user level
+  levels.push({
+    name: 'user',
+    path: USER_CLAUDE_SETTINGS
+  });
+  
+  // Check each level
+  for (const level of levels) {
+    if (!fs.existsSync(level.path)) {
+      debugLog('PERMISSION_CHECK', `Level ${level.name} settings not found`, { path: level.path });
+      continue;
+    }
+    
+    const settings = loadJson(level.path, {});
+    if (!settings.permissions) {
+      debugLog('PERMISSION_CHECK', `Level ${level.name} has no permissions`, { path: level.path });
+      continue;
+    }
+    
+    debugLog('PERMISSION_CHECK', `Checking ${level.name} level permissions`, {
+      path: level.path,
+      allow: settings.permissions.allow?.length || 0,
+      deny: settings.permissions.deny?.length || 0
+    });
+    
+    // Check deny list first (takes precedence)
+    if (settings.permissions.deny && Array.isArray(settings.permissions.deny)) {
+      for (const rule of settings.permissions.deny) {
+        if (patternMatches(pattern, rule)) {
+          debugLog('PERMISSION_MATCH', 'Pattern matched deny rule', {
+            pattern,
+            rule,
+            level: level.name,
+            decision: 'deny'
+          });
+          return { decision: 'deny', level: level.name, rule };
+        }
+      }
+    }
+    
+    // Check allow list
+    if (settings.permissions.allow && Array.isArray(settings.permissions.allow)) {
+      for (const rule of settings.permissions.allow) {
+        if (patternMatches(pattern, rule)) {
+          debugLog('PERMISSION_MATCH', 'Pattern matched allow rule', {
+            pattern,
+            rule,
+            level: level.name,
+            decision: 'allow'
+          });
+          return { decision: 'allow', level: level.name, rule };
+        }
+      }
+    }
+  }
+  
+  // No match found - Claude will ask for permission
+  debugLog('PERMISSION_CHECK', 'No matching rules found', {
+    pattern,
+    decision: 'ask'
+  });
+  return { decision: 'ask', level: null, rule: null };
+}
+
+// Add permission to Claude settings - preferring local settings if in a project
+function addPermissionToSettings(pattern, cwd) {
+  // Determine the appropriate settings file based on cwd
+  let settingsPath = USER_CLAUDE_SETTINGS;
+  let settingsType = 'user';
+  
+  // Check if we're in a project with .claude directory
+  if (cwd) {
+    let currentDir = cwd;
+    while (currentDir !== '/' && currentDir !== path.dirname(currentDir)) {
+      const claudeDir = path.join(currentDir, '.claude');
+      if (fs.existsSync(claudeDir)) {
+        // Found project root, use local settings
+        settingsPath = path.join(claudeDir, 'settings.local.json');
+        settingsType = 'local';
+        break;
+      }
+      currentDir = path.dirname(currentDir);
+    }
+  }
+  
+  ensureDir(path.dirname(settingsPath));
+  const settings = loadJson(settingsPath, {});
+  
+  if (!settings.permissions) {
+    settings.permissions = { allow: [], deny: [] };
+  }
+  if (!settings.permissions.allow) {
+    settings.permissions.allow = [];
+  }
+  
+  // Check if pattern already exists
+  if (!settings.permissions.allow.includes(pattern)) {
+    settings.permissions.allow.push(pattern);
+    saveJson(settingsPath, settings);
+    eprint(`[afk] Added ${pattern} to ${settingsType} settings: ${settingsPath}`);
+    debugLog('ALLOW_ALL', `Added pattern to ${settingsType} settings`, {
+      pattern,
+      settingsPath,
+      settingsType
+    });
+    return true;
+  }
+  debugLog('ALLOW_ALL', 'Pattern already exists', { pattern, settingsPath });
+  return false;
+}
+
+function ensureExecutable(p) {
+  try {
+    const st = fs.statSync(p);
+    fs.chmodSync(p, st.mode | 0o111);
+  } catch (_) {}
+}
+
+function toPosix(p) { return p.split(path.sep).join('/'); }
+
+function readMode() {
+  if (fs.existsSync(STATE_FILE)) {
+    const v = fs.readFileSync(STATE_FILE, 'utf8').trim();
+    return (v === 'remote' || v === 'local') ? v : DEFAULT_MODE;
+  }
+  return DEFAULT_MODE;
+}
+
+function writeMode(mode) {
+  ensureDir(USER_CFG_DIR);
+  fs.writeFileSync(STATE_FILE, mode);
+}
+
+function cfg() {
+  const c = loadJson(USER_CFG, {});
+  c.telegram_bot_token ||= process.env.TELEGRAM_BOT_TOKEN || '';
+  c.telegram_chat_id ||= process.env.TELEGRAM_CHAT_ID || '';
+  c.timeout_seconds ||= DEFAULT_TIMEOUT;
+  c.timeout_action ||= DEFAULT_TIMEOUT_ACTION; // What to do on timeout: 'deny', 'allow', or 'wait'
+  c.intercept_matcher ||= 'Bash|Edit|Write|MultiEdit|WebFetch|mcp__.*';
+  c.auto_approve_tools ||= ['Read'];
+  return c;
+}
+
+function writeDefaultConfig() {
+  if (!fs.existsSync(USER_CFG)) {
+    saveJson(USER_CFG, cfg());
+    console.log(`Wrote default config at ${USER_CFG}`);
+  }
+  ensureDir(USER_CFG_DIR);
+  ensureDir(APPROVAL_DIR);
+  // Ensure history files exist
+  if (!fs.existsSync(SESSION_MAP_FILE)) saveJson(SESSION_MAP_FILE, { messages: {}, latest_per_chat: {} });
+  if (!fs.existsSync(HISTORY_FILE)) fs.writeFileSync(HISTORY_FILE, '');
+}
+
+function readStdinJson() {
+  return new Promise((resolve, reject) => {
+    let data = '';
+    process.stdin.setEncoding('utf8');
+    process.stdin.on('data', chunk => data += chunk);
+    process.stdin.on('end', () => {
+      try { resolve(JSON.parse(data || '{}')); }
+      catch (e) { reject(e); }
+    });
+    process.stdin.on('error', reject);
+  });
+}
+
+// ---------------------------
+// Installation detection
+// ---------------------------
+function isInstalled() {
+  // Check if hooks are installed at any scope
+  const HOME = os.homedir();
+  
+  // Check user scope: ~/.claude/settings.json
+  const userSettingsPath = path.join(HOME, '.claude', 'settings.json');
+  if (fs.existsSync(userSettingsPath)) {
+    try {
+      const settings = JSON.parse(fs.readFileSync(userSettingsPath, 'utf8'));
+      if (settings.hooks && settings.hooks.PreToolUse) {
+        // Check if any PreToolUse hooks contain afk command
+        for (const hookGroup of settings.hooks.PreToolUse) {
+          if (hookGroup.hooks) {
+            for (const hook of hookGroup.hooks) {
+              if (hook.command && hook.command.includes('afk')) {
+                return true;
+              }
+            }
+          }
+        }
+      }
+    } catch (e) {
+      // Ignore parse errors
+    }
+  }
+  
+  // Check project/local scope: ./.claude/settings.json or ./.claude/settings.local.json
+  const cwd = process.cwd();
+  let currentDir = cwd;
+  while (currentDir !== '/' && currentDir !== path.dirname(currentDir)) {
+    const claudeDir = path.join(currentDir, '.claude');
+    if (fs.existsSync(claudeDir)) {
+      // Check both project and local settings
+      for (const filename of ['settings.json', 'settings.local.json']) {
+        const settingsPath = path.join(claudeDir, filename);
+        if (fs.existsSync(settingsPath)) {
+          try {
+            const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+            if (settings.hooks && settings.hooks.PreToolUse) {
+              // Check if any PreToolUse hooks contain afk command
+              for (const hookGroup of settings.hooks.PreToolUse) {
+                if (hookGroup.hooks) {
+                  for (const hook of hookGroup.hooks) {
+                    if (hook.command && hook.command.includes('afk')) {
+                      return true;
+                    }
+                  }
+                }
+              }
+            }
+          } catch (e) {
+            // Ignore parse errors
+          }
+        }
+      }
+      break; // Stop searching once we find a .claude directory
+    }
+    currentDir = path.dirname(currentDir);
+  }
+  
+  return false;
+}
+
+// ---------------------------
+// Markdown escaping for Telegram
+// ---------------------------
+function escapeMarkdown(text) {
+  if (typeof text !== 'string') return text;
+  // Escape special Markdown characters for Telegram
+  // Order matters: escape backslashes first
+  return text
+    .replace(/\\/g, '\\\\')
+    .replace(/([_*\[\]()~`>#+\-=|{}.!])/g, '\\$1');
+}
+
+// ---------------------------
+// Session tracking
+// ---------------------------
+function trackActiveSession(sessionId, toolCall, metadata = {}) {
+  debugLog('SESSION_TRACKING', 'Tracking new active session', { sessionId, toolCall });
+  
+  if (!fs.existsSync(USER_CFG_DIR)) {
+    fs.mkdirSync(USER_CFG_DIR, { recursive: true });
+  }
+  
+  let activeSessions = {};
+  if (fs.existsSync(ACTIVE_SESSIONS_FILE)) {
+    try {
+      const data = fs.readFileSync(ACTIVE_SESSIONS_FILE, 'utf-8');
+      activeSessions = JSON.parse(data);
+    } catch (err) {
+      debugLog('SESSION_TRACKING', 'Failed to read active sessions file', { error: err.message });
+    }
+  }
+  
+  activeSessions[sessionId] = {
+    toolCall,
+    metadata,
+    startTime: new Date().toISOString(),
+    lastActivity: new Date().toISOString(),
+    pid: process.pid
+  };
+  
+  try {
+    fs.writeFileSync(ACTIVE_SESSIONS_FILE, JSON.stringify(activeSessions, null, 2));
+    debugLog('SESSION_TRACKING', 'Active session tracked', { sessionId, totalSessions: Object.keys(activeSessions).length });
+  } catch (err) {
+    debugLog('SESSION_TRACKING', 'Failed to write active sessions file', { error: err.message });
+  }
+}
+
+function updateSessionActivity(sessionId) {
+  if (!fs.existsSync(ACTIVE_SESSIONS_FILE)) return;
+  
+  try {
+    const data = fs.readFileSync(ACTIVE_SESSIONS_FILE, 'utf-8');
+    const activeSessions = JSON.parse(data);
+    
+    if (activeSessions[sessionId]) {
+      activeSessions[sessionId].lastActivity = new Date().toISOString();
+      fs.writeFileSync(ACTIVE_SESSIONS_FILE, JSON.stringify(activeSessions, null, 2));
+      debugLog('SESSION_TRACKING', 'Session activity updated', { sessionId });
+    }
+  } catch (err) {
+    debugLog('SESSION_TRACKING', 'Failed to update session activity', { sessionId, error: err.message });
+  }
+}
+
+function removeActiveSession(sessionId) {
+  if (!fs.existsSync(ACTIVE_SESSIONS_FILE)) return;
+  
+  try {
+    const data = fs.readFileSync(ACTIVE_SESSIONS_FILE, 'utf-8');
+    const activeSessions = JSON.parse(data);
+    
+    if (activeSessions[sessionId]) {
+      delete activeSessions[sessionId];
+      fs.writeFileSync(ACTIVE_SESSIONS_FILE, JSON.stringify(activeSessions, null, 2));
+      debugLog('SESSION_TRACKING', 'Active session removed', { sessionId, remainingSessions: Object.keys(activeSessions).length });
+    }
+  } catch (err) {
+    debugLog('SESSION_TRACKING', 'Failed to remove active session', { sessionId, error: err.message });
+  }
+}
+
+function checkAbandonedSessions() {
+  if (!fs.existsSync(ACTIVE_SESSIONS_FILE)) return [];
+  
+  try {
+    const data = fs.readFileSync(ACTIVE_SESSIONS_FILE, 'utf-8');
+    const activeSessions = JSON.parse(data);
+    const now = new Date();
+    const abandonedSessions = [];
+    
+    for (const [sessionId, session] of Object.entries(activeSessions)) {
+      const lastActivity = new Date(session.lastActivity);
+      const timeSinceActivity = (now - lastActivity) / 1000; // seconds
+      
+      // Consider session abandoned after 5 minutes of inactivity
+      if (timeSinceActivity > 300) {
+        abandonedSessions.push({
+          sessionId,
+          ...session,
+          inactiveFor: timeSinceActivity
+        });
+      }
+    }
+    
+    if (abandonedSessions.length > 0) {
+      debugLog('SESSION_TRACKING', 'Found abandoned sessions', { count: abandonedSessions.length });
+    }
+    
+    return abandonedSessions;
+  } catch (err) {
+    debugLog('SESSION_TRACKING', 'Failed to check abandoned sessions', { error: err.message });
+    return [];
+  }
+}
+
+async function notifyAbandonedSession(session) {
+  const config = readConfig();
+  if (!config?.telegram?.token || !config?.telegram?.chatId) {
+    debugLog('SESSION_TRACKING', 'Cannot notify abandoned session - no Telegram config');
+    return;
+  }
+  
+  const inactiveMinutes = Math.floor(session.inactiveFor / 60);
+  const message = escapeMarkdown(`⚠️ Abandoned Session Detected
+
+Session ID: ${session.sessionId}
+Tool Call: ${session.toolCall}
+Started: ${new Date(session.startTime).toLocaleString()}
+Inactive for: ${inactiveMinutes} minutes
+
+This approval request appears to have been abandoned. The Claude Code session may have closed unexpectedly.`);
+  
+  try {
+    await tgApiWithToken(config.telegram.token, 'sendMessage', {
+      chat_id: config.telegram.chatId,
+      text: message,
+      parse_mode: 'MarkdownV2'
+    });
+    
+    debugLog('SESSION_TRACKING', 'Abandoned session notification sent', { sessionId: session.sessionId });
+  } catch (err) {
+    debugLog('SESSION_TRACKING', 'Failed to send abandoned session notification', { 
+      sessionId: session.sessionId, 
+      error: err.message 
+    });
+  }
+}
+
+// ---------------------------
+// Telegram API (no deps)
+// ---------------------------
+function tgApiWithToken(token, method, params = {}, { timeoutMs = 10000 } = {}) {
+  if (!token) {
+    debugLog('TELEGRAM_ERROR', 'No token provided for API call', { method });
+    return Promise.reject(new Error('Telegram not configured'));
+  }
+  debugLog('TELEGRAM_API', `Calling API: ${method}`, {
+    method,
+    params: Object.keys(params),
+    timeoutMs
+  });
+  const body = new URLSearchParams();
+  for (const [k, v] of Object.entries(params)) body.append(k, String(v));
+  const data = body.toString();
+  const options = {
+    hostname: 'api.telegram.org',
+    path: `/bot${token}/${method}`,
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'Content-Length': Buffer.byteLength(data)
+    },
+    timeout: timeoutMs
+  };
+  return new Promise((resolve, reject) => {
+    const req = https.request(options, res => {
+      let out = '';
+      res.on('data', c => out += c);
+      res.on('end', () => {
+        try {
+          const j = JSON.parse(out || '{}');
+          if (j.ok) {
+            debugLog('TELEGRAM_API', 'API call succeeded', { method });
+            resolve(j.result);
+          } else {
+            debugLog('TELEGRAM_API_ERROR', 'API call failed', {
+              method,
+              error: j.description
+            });
+            reject(new Error(j.description || 'Telegram error'));
+          }
+        } catch (e) { 
+          debugLog('TELEGRAM_API_ERROR', 'Failed to parse response', {
+            method,
+            error: e.message
+          });
+          reject(e);
+        }
+      });
+    });
+    req.on('error', reject);
+    req.write(data);
+    req.end();
+  });
+}
+
+function sendTelegram(text, reply_markup) {
+  const { telegram_chat_id: chat, telegram_bot_token: token } = cfg();
+  if (!token || !chat) {
+    debugLog('TELEGRAM_ERROR', 'Telegram not configured for sendTelegram', {
+      hasToken: !!token,
+      hasChatId: !!chat
+    });
+    return Promise.resolve([false, 'Telegram not configured']);
+  }
+  debugLog('TELEGRAM_SEND', 'Sending message (legacy)', {
+    textLength: text.length,
+    hasKeyboard: !!reply_markup
+  });
+  const params = { chat_id: chat, text, parse_mode: 'Markdown' };
+  if (reply_markup) params.reply_markup = JSON.stringify(reply_markup);
+  return tgApiWithToken(token, 'sendMessage', params)
+    .then(() => {
+      debugLog('TELEGRAM_SEND', 'Message sent (legacy)', { success: true });
+      return [true, null];
+    })
+    .catch(err => {
+      debugLog('TELEGRAM_SEND_ERROR', 'Failed to send (legacy)', { error: err.message });
+      return [false, err.message || String(err)];
+    });
+}
+
+async function sendTelegramMessage(text, reply_markup) {
+  const { telegram_chat_id: chat, telegram_bot_token: token } = cfg();
+  if (!token || !chat) {
+    debugLog('TELEGRAM_ERROR', 'Telegram not configured', {
+      hasToken: !!token,
+      hasChatId: !!chat
+    });
+    throw new Error('Telegram not configured');
+  }
+  debugLog('TELEGRAM_SEND', 'Sending message', {
+    textLength: text.length,
+    hasKeyboard: !!reply_markup,
+    chatId: chat
+  });
+  const params = { chat_id: chat, text, parse_mode: 'Markdown' };
+  if (reply_markup) params.reply_markup = JSON.stringify(reply_markup);
+  const result = await tgApiWithToken(token, 'sendMessage', params);
+  debugLog('TELEGRAM_SEND', 'Message sent', {
+    messageId: result?.message_id,
+    chatId: result?.chat?.id
+  });
+  return result;
+}
+
+// ---------------------------
+// Settings writer
+// ---------------------------
+function installAfkSlashCommand(scopeDir) {
+  const cmdDir = path.join(scopeDir, 'commands');
+  ensureDir(cmdDir);
+  fs.writeFileSync(path.join(cmdDir, 'afk.md'),
+    'Toggle AFK mode for remote approvals.\n\n' +
+    '**Usage:** Use `afk on|off|toggle|status` in terminal.\n\n' +
+    '_Note: /afk commands removed - use CLI directly._\n'
+  );
+}
+
+function mergeHooks(existing, commands, event, matcher = null) {
+  existing.hooks ||= {};
+  existing.hooks[event] ||= [];
+  const bucket = existing.hooks[event];
+  if (matcher) {
+    let group = bucket.find(m => m.matcher === matcher);
+    if (!group) { group = { matcher, hooks: [] }; bucket.push(group); }
+    for (const h of commands) if (!group.hooks.find(x => x.command === h.command)) group.hooks.push(h);
+  } else {
+    const entry = { hooks: commands };
+    if (!bucket.find(e => JSON.stringify(e) === JSON.stringify(entry))) bucket.push(entry);
+  }
+  return existing;
+}
+
+function writeSettings(scope, projectRoot) {
+  let settingsPath, hookCmdBase, scopeDir;
+  if (scope === 'user') {
+    settingsPath = path.join(HOME, '.claude', 'settings.json');
+    hookCmdBase = toPosix(path.join(USER_BIN, 'afk'));
+    scopeDir = path.join(HOME, '.claude');
+  } else {
+    if (!projectRoot) throw new Error('project_root required');
+    scopeDir = path.join(projectRoot, '.claude');
+    settingsPath = path.join(scopeDir, scope === 'local' ? 'settings.local.json' : 'settings.json');
+    const dest = path.join(scopeDir, 'hooks', 'afk');
+    ensureDir(path.dirname(dest));
+    fs.copyFileSync(process.argv[1], dest);
+    ensureExecutable(dest);
+    hookCmdBase = toPosix(dest);
+  }
+
+  const pretoolCmd = `${hookCmdBase} hook pretooluse`;
+  const stopCmd = `${hookCmdBase} hook stop`;
+
+  let settings = loadJson(settingsPath, {});
+  settings = mergeHooks(settings, [{ type: 'command', command: pretoolCmd, timeout: 21600 }], 'PreToolUse', cfg().intercept_matcher);
+  // Notification hook removed - redundant with PreToolUse  
+  settings = mergeHooks(settings, [{ type: 'command', command: stopCmd, timeout: 21600 }], 'Stop', null);
+  // UserPromptSubmit hook removed - simplifying to just PreToolUse and Stop
+
+  saveJson(settingsPath, settings);
+  installAfkSlashCommand(scopeDir);
+  return settingsPath;
+}
+
+// ---------------------------
+// Session map and history
+// ---------------------------
+function projectLabel(cwd) {
+  if (!cwd) return '(unknown)';
+  const parts = cwd.split(path.sep).filter(Boolean);
+  if (parts.length >= 2) return parts.slice(-2).join('/');
+  return parts[parts.length - 1] || cwd;
+}
+
+function shortSession(sessionId) {
+  if (!sessionId) return '(unknown)';
+  return String(sessionId).slice(-8);
+}
+
+// Extract conversation context from transcript
+function extractConversationContext(transcriptPath, maxLines = 20) {
+  if (!transcriptPath || !fs.existsSync(transcriptPath)) {
+    return { error: 'No transcript available' };
+  }
+  
+  try {
+    // Read last N lines efficiently for large files
+    const { execSync } = require('child_process');
+    const lines = execSync(`tail -${maxLines} "${transcriptPath}"`, { encoding: 'utf8' })
+      .trim()
+      .split('\n')
+      .filter(Boolean);
+    
+    const recentMessages = [];
+    let lastUserMessage = null;
+    let lastAssistantMessage = null;
+    
+    for (const line of lines) {
+      try {
+        const entry = JSON.parse(line);
+        if (!entry.message || !entry.message.role) continue;
+        
+        const role = entry.message.role;
+        const content = entry.message.content;
+        
+        // Extract text content
+        let text = '';
+        if (Array.isArray(content)) {
+          for (const item of content) {
+            if (item.type === 'text') {
+              text += item.text + ' ';
+            } else if (item.type === 'tool_use') {
+              text += `[${item.name}: ${item.input ? Object.keys(item.input)[0] || 'action' : 'call'}] `;
+            }
+          }
+        } else if (typeof content === 'string') {
+          text = content;
+        }
+        
+        text = text.trim();
+        if (text && text.length > 3) { // Skip very short messages
+          const msg = {
+            role,
+            text: text, // Don't trim - keep full message
+            timestamp: entry.timestamp
+          };
+          
+          recentMessages.push(msg);
+          
+          if (role === 'user') lastUserMessage = msg;
+          else if (role === 'assistant') lastAssistantMessage = msg;
+        }
+      } catch (e) {
+        // Skip malformed lines, but log for debugging
+        continue;
+      }
+    }
+    
+    // Get last few meaningful messages (user and assistant alternating)
+    const contextMessages = recentMessages.slice(-6);
+    
+    return {
+      lastUserMessage,
+      lastAssistantMessage, 
+      recentMessages: contextMessages,
+      messageCount: contextMessages.length,
+      totalLinesProcessed: lines.length
+    };
+  } catch (e) {
+    return { error: `Failed to read transcript: ${e.message}` };
+  }
+}
+
+// Analyze what Claude was trying to accomplish
+function analyzeClaudeIntent(context, toolName, toolInput) {
+  if (!context.lastAssistantMessage) {
+    return "No recent context available";
+  }
+  
+  const lastText = context.lastAssistantMessage.text.toLowerCase();
+  
+  // Common patterns
+  if (lastText.includes('let me') || lastText.includes('i\'ll') || lastText.includes('i need to')) {
+    if (toolName === 'Write' || toolName === 'Edit') {
+      return `💡 **Context:** Claude is working on file modifications`;
+    } else if (toolName === 'Bash') {
+      const cmd = toolInput.command || '';
+      if (cmd.includes('test')) {
+        return `💡 **Context:** Claude is running tests`;
+      } else if (cmd.includes('build') || cmd.includes('compile')) {
+        return `💡 **Context:** Claude is building the project`;
+      } else if (cmd.includes('git')) {
+        return `💡 **Context:** Claude is working with git`;
+      }
+      return `💡 **Context:** Claude is running commands`;
+    }
+  }
+  
+  if (lastText.includes('error') || lastText.includes('fix') || lastText.includes('debug')) {
+    return `🔧 **Context:** Claude is debugging/fixing issues`;
+  }
+  
+  if (lastText.includes('test') && (toolName === 'Bash' && toolInput.command && toolInput.command.includes('test'))) {
+    return `🧪 **Context:** Claude is running tests`;
+  }
+  
+  return `🤖 **Context:** Claude is working on the project`;
+}
+
+function loadSessionMap() {
+  return loadJson(SESSION_MAP_FILE, { messages: {}, latest_per_chat: {} });
+}
+
+function saveSessionMap(map) {
+  saveJson(SESSION_MAP_FILE, map);
+}
+
+function rememberMessageMapping(messageId, mapping) {
+  const map = loadSessionMap();
+  map.messages[String(messageId)] = { ...mapping };
+  if (mapping.chat_id && mapping.session_id) {
+    map.latest_per_chat[String(mapping.chat_id)] = mapping.session_id;
+  }
+  saveSessionMap(map);
+}
+
+function lookupSessionByMessageId(messageId) {
+  const map = loadSessionMap();
+  return map.messages[String(messageId)] || null;
+}
+
+function getLatestSessionForChat(chatId) {
+  const map = loadSessionMap();
+  return map.latest_per_chat[String(chatId)] || null;
+}
+
+function setLatestSessionForChat(chatId, sessionId) {
+  const map = loadSessionMap();
+  map.latest_per_chat[String(chatId)] = sessionId;
+  saveSessionMap(map);
+}
+
+// Session locking system - prevents cross-session message stealing
+const REPLY_LOCK_FILE = path.join(USER_CFG_DIR, 'reply-lock.json');
+
+function setReplyLock(sessionId, messageId) {
+  const lock = {
+    sessionId,
+    messageId,
+    timestamp: Date.now()
+    // No expiration - lock persists until explicitly cleared or taken by another session
+  };
+  try {
+    fs.writeFileSync(REPLY_LOCK_FILE, JSON.stringify(lock, null, 2));
+    eprint(`🔒 [afk] Session ${sessionId.substring(0, 8)} now owns next message`);
+  } catch (e) {
+    eprint('[reply-lock] Failed to set lock:', e.message);
+  }
+}
+
+function getReplyLock() {
+  try {
+    if (!fs.existsSync(REPLY_LOCK_FILE)) return null;
+    const lock = JSON.parse(fs.readFileSync(REPLY_LOCK_FILE, 'utf8'));
+    
+    // No expiration check - lock persists until explicitly managed
+    return lock;
+  } catch (e) {
+    eprint('[reply-lock] Failed to read lock:', e.message);
+    return null;
+  }
+}
+
+function clearReplyLock() {
+  try {
+    if (fs.existsSync(REPLY_LOCK_FILE)) {
+      fs.unlinkSync(REPLY_LOCK_FILE);
+      eprint(`🔓 [afk] Reply lock cleared`);
+    }
+  } catch (e) {
+    eprint('[reply-lock] Failed to clear lock:', e.message);
+  }
+}
+
+function isMyMessage(sessionId, message) {
+  const lock = getReplyLock();
+  
+  // If no lock, any session can take messages (backward compatibility)
+  if (!lock) return true;
+  
+  // If this session owns the lock, it can take the message
+  if (lock.sessionId === sessionId) {
+    eprint(`✅ [afk] Session ${sessionId.substring(0, 8)} owns this message`);
+    return true;
+  }
+  
+  // Check if message is a reply to the specific locked message
+  if (message.reply_to_message && message.reply_to_message.message_id === lock.messageId) {
+    eprint(`✅ [afk] Message is reply to locked message ${lock.messageId}`);
+    return true;
+  }
+  
+  eprint(`🚫 [afk] Session ${sessionId.substring(0, 8)} cannot take message - owned by ${lock.sessionId.substring(0, 8)}`);
+  return false;
+}
+
+function appendHistory(event) {
+  try {
+    const enriched = { ts: Date.now(), ...event };
+    fs.appendFileSync(HISTORY_FILE, JSON.stringify(enriched) + '\n');
+    // Trim to last 200 lines if file grows too big
+    const data = fs.readFileSync(HISTORY_FILE, 'utf8').split('\n');
+    if (data.length > 400) {
+      const trimmed = data.slice(-200).join('\n');
+      fs.writeFileSync(HISTORY_FILE, trimmed.endsWith('\n') ? trimmed : trimmed + '\n');
+    }
+  } catch (e) {
+    eprint('[history] failed to write:', e.message);
+  }
+}
+
+function readHistorySince(ts, filterFn) {
+  try {
+    const lines = fs.readFileSync(HISTORY_FILE, 'utf8').trim().split('\n').filter(Boolean);
+    const events = [];
+    for (const line of lines) {
+      try {
+        const ev = JSON.parse(line);
+        if (!ts || ev.ts >= ts) events.push(ev);
+      } catch (_) {}
+    }
+    return filterFn ? events.filter(filterFn) : events;
+  } catch (e) {
+    return [];
+  }
+}
+
+// ---------------------------
+// Hook Handlers
+// ---------------------------
+// UserPromptSubmit hook removed - /afk commands now handled via CLI only
+
+function summarizeTool(toolName, toolInput) {
+  try {
+    if (toolName === 'Bash') {
+      const cmd = escapeMarkdown(toolInput.command || '');
+      return `*Bash*:\n\`${cmd}\``;
+    }
+    if (['Write','Edit','MultiEdit'].includes(toolName)) {
+      const fp = escapeMarkdown(toolInput.file_path || toolInput.filePath || toolInput.path);
+      return `*${toolName}*:\n${fp}`;
+    }
+    if (['Read','Glob','Grep'].includes(toolName)) return `*${toolName}*`;
+    if (['WebFetch','WebSearch'].includes(toolName)) {
+      const u = escapeMarkdown(toolInput.url || toolInput.query);
+      return `*${toolName}*:\n\`${u}\``;
+    }
+    if (toolName && toolName.startsWith('mcp__')) return `*MCP Tool* \`${escapeMarkdown(toolName)}\``;
+  } catch (_) {}
+  return `*${escapeMarkdown(toolName || 'Unknown')}*`;
+}
+
+async function hookPreToolUse() {
+  const data = await readStdinJson();
+  const toolName = data.tool_name;
+  const toolInput = data.tool_input || {};
+  const sessionId = data.session_id;
+  const cwd = data.cwd;
+
+  // Only use debug logging to avoid polluting stdout/stderr that Claude Code reads
+  debugLog('HOOK_PRETOOL', 'PreToolUse hook triggered', {
+    toolName,
+    toolInput,
+    sessionId,
+    cwd,
+    transcript_path: data.transcript_path
+  });
+
+  // Check afk's auto-approve list first
+  const autoApproveTools = [
+    ...cfg().auto_approve_tools,
+    'TodoWrite',        // Internal task management
+    'ExitPlanMode',     // Internal mode switching
+    'Task',             // Internal task delegation
+    'LS',               // Safe file listing
+    'Glob'              // Safe file pattern matching
+  ];
+  
+  
+  if (autoApproveTools.includes(toolName)) {
+    // Let Claude handle this - we trust these tools
+    debugLog('HOOK_PRETOOL', 'Tool in auto-approve list, skipping intervention', { 
+      toolName, 
+      decision: 'skip',
+      reason: 'auto-approved tool'
+    });
+    process.stdout.write(JSON.stringify({}));
+    return;
+  }
+
+  // In local mode, don't interfere at all
+  const mode = readMode();
+  if (mode !== 'remote') {
+    debugLog('HOOK_PRETOOL', 'Local mode - skipping intervention', {
+      mode,
+      decision: 'skip',
+      reason: 'local mode active'
+    });
+    process.stdout.write(JSON.stringify({}));
+    return;
+  }
+  
+  // Check Claude's permission system at all levels
+  const respectClaudePermissions = cfg().respect_claude_permissions !== false; // Default: true
+  if (respectClaudePermissions) {
+    const patterns = generatePermissionPattern(toolName, toolInput);
+    debugLog('PERMISSION_CHECK', 'Generated permission patterns', { patterns });
+    
+    // Handle compound commands (patterns will be an array)
+    if (Array.isArray(patterns)) {
+      let hasAsk = false;
+      let hasAllow = false;
+      let hasDeny = false;
+      let allowedPatterns = [];
+      let deniedPatterns = [];
+      
+      debugLog('PERMISSION_CHECK', 'Checking compound command patterns', { 
+        patternCount: patterns.length,
+        patterns 
+      });
+      
+      for (const pattern of patterns) {
+        const decision = checkClaudePermissions(pattern, {}, cwd);
+        debugLog('PERMISSION_CHECK', 'Pattern permission result', {
+          pattern,
+          decision: decision.decision,
+          level: decision.level,
+          rule: decision.rule
+        });
+        
+        if (decision.decision === 'ask') {
+          hasAsk = true;
+        } else if (decision.decision === 'allow') {
+          hasAllow = true;
+          allowedPatterns.push(pattern);
+        } else if (decision.decision === 'deny') {
+          hasDeny = true;
+          deniedPatterns.push(pattern);
+        }
+      }
+      
+      // If any command needs approval, we need to ask for all of them
+      if (hasAsk) {
+        eprint(`[afk] Compound command needs approval for: ${patterns.join(', ')}`);
+        debugLog('PERMISSION_CHECK', 'Compound command needs Telegram approval', {
+          hasAsk, hasAllow, hasDeny,
+          allowedPatterns, deniedPatterns
+        });
+        // Continue to Telegram approval with all patterns
+      } else {
+        // All commands are either allowed or denied by Claude
+        // In remote mode, we should be explicit about our decision
+        if (deniedPatterns.length > 0) {
+          eprint(`[afk] Commands denied by Claude: ${deniedPatterns.join(', ')}`);
+          const decision = {
+            hookSpecificOutput: {
+              hookEventName: 'PreToolUse',
+              permissionDecision: 'deny',
+              permissionDecisionReason: `Denied by Claude permissions (${deniedPatterns.length} pattern${deniedPatterns.length > 1 ? 's' : ''})`
+            }
+          };
+          debugLog('DECISION', 'Denying based on Claude permissions', {
+            deniedPatterns,
+            decision: 'deny',
+            output: decision
+          });
+          process.stdout.write(JSON.stringify(decision));
+          return;
+        } else if (allowedPatterns.length > 0) {
+          eprint(`[afk] Commands allowed by Claude: ${allowedPatterns.join(', ')}`);
+          const decision = {
+            hookSpecificOutput: {
+              hookEventName: 'PreToolUse',
+              permissionDecision: 'allow',
+              permissionDecisionReason: `Allowed by Claude permissions (${allowedPatterns.length} pattern${allowedPatterns.length > 1 ? 's' : ''})`
+            }
+          };
+          debugLog('DECISION', 'Allowing based on Claude permissions', {
+            allowedPatterns,
+            decision: 'allow',
+            output: decision
+          });
+          process.stdout.write(JSON.stringify(decision));
+          return;
+        }
+      }
+    } else {
+      // Single command
+      const permCheck = checkClaudePermissions(patterns, {}, cwd);
+      debugLog('PERMISSION_CHECK', 'Single pattern permission result', {
+        pattern: patterns,
+        decision: permCheck.decision,
+        level: permCheck.level,
+        rule: permCheck.rule
+      });
+      
+      if (permCheck.decision === 'allow') {
+        // Claude would allow this - be explicit about allowing it
+        eprint(`[afk] Tool allowed by Claude (${permCheck.level}): ${permCheck.rule}`);
+        process.stdout.write(JSON.stringify({
+          hookSpecificOutput: {
+            hookEventName: 'PreToolUse',
+            permissionDecision: 'allow',
+            permissionDecisionReason: `Allowed by Claude permissions (${permCheck.level}): ${permCheck.rule}`
+          }
+        }));
+        return;
+      }
+      
+      if (permCheck.decision === 'deny') {
+        // Claude would deny this - be explicit about denying it
+        eprint(`[afk] Tool denied by Claude (${permCheck.level}): ${permCheck.rule}`);
+        process.stdout.write(JSON.stringify({
+          hookSpecificOutput: {
+            hookEventName: 'PreToolUse',
+            permissionDecision: 'deny',
+            permissionDecisionReason: `Denied by Claude permissions (${permCheck.level}): ${permCheck.rule}`
+          }
+        }));
+        return;
+      }
+      
+      // If decision is 'ask', we'll show our Telegram approval UI
+    }
+  }
+
+  const approvalId = cryptoRandomId();
+  ensureDir(APPROVAL_DIR);
+  const approvalFile = path.join(APPROVAL_DIR, approvalId);
+  
+  // Track active session for abandoned session detection
+  const toolCallSummary = `${toolName}${toolInput.command ? `(${toolInput.command})` : ''}`;
+  const patterns = generatePermissionPattern(toolName, toolInput);
+  trackActiveSession(sessionId, toolCallSummary, {
+    approvalId,
+    cwd,
+    patterns: Array.isArray(patterns) ? patterns : [patterns]
+  });
+
+  const summary = summarizeTool(toolName, toolInput);
+  const label = projectLabel(cwd);
+  
+  // Extract conversation context
+  const context = extractConversationContext(data.transcript_path);
+  const intent = analyzeClaudeIntent(context, toolName, toolInput);
+  
+  // Format pattern display for compound commands
+  let patternText;
+  if (Array.isArray(patterns)) {
+    patternText = patterns.length > 3 ? 
+      `${patterns.slice(0, 3).join('`, `')}... (+${patterns.length - 3} more)` :
+      patterns.join('`, `');
+  } else {
+    patternText = patterns;
+  }
+  
+  // Build context section
+  let contextSection = '';
+  if (intent !== "No recent context available") {
+    contextSection += `\n${intent}\n`;
+  }
+  
+  // Show recent conversation history
+  if (context.recentMessages && context.recentMessages.length > 1 && !context.error) {
+    contextSection += `\n💬 **Recent conversation:**`;
+    
+    // Show last 3-4 messages to keep it manageable
+    const messagesToShow = context.recentMessages.slice(-4);
+    for (const msg of messagesToShow) {
+      const roleIcon = msg.role === 'user' ? '👤' : '🤖';
+      // Don't trim messages - show full content
+      contextSection += `\n${roleIcon} ${msg.text}`;
+    }
+  } else if (context.lastUserMessage && !context.error) {
+    const userText = context.lastUserMessage.text.substring(0, 100);
+    contextSection += `\n📝 **Last user:** "${userText}${userText.length >= 100 ? '...' : ''}"`;
+  }
+  
+  const text = `🤖 *Approval required* — ${label}\n${summary}${contextSection}\n\n_Pattern${Array.isArray(patterns) ? 's' : ''}:_ \`${patternText}\`\n_Session:_ \`${shortSession(sessionId)}\`\n_Dir:_ \`${cwd}\``;
+  
+  // Store metadata for Allow All functionality (avoids Telegram's 64-byte limit)
+  const metaFile = path.join(APPROVAL_DIR, `${approvalId}.meta`);
+  fs.writeFileSync(metaFile, JSON.stringify({ patterns, toolName, toolInput, cwd, sessionId }));
+  const keyboard = { inline_keyboard: [
+    [
+      { text: '✅ Approve', callback_data: `approve:${approvalId}` },
+      { text: '❌ Deny', callback_data: `deny:${approvalId}` }
+    ],
+    [
+      { text: '✅ Allow All', callback_data: `allow_all:${approvalId}` },
+      { text: '🔧 Ask Claude UI', callback_data: `ask_ui:${approvalId}` }
+    ]
+  ] };
+  let msgRes = null;
+  try {
+    msgRes = await sendTelegramMessage(text, keyboard);
+    if (msgRes && msgRes.message_id && msgRes.chat) {
+      rememberMessageMapping(msgRes.message_id, {
+        kind: 'approval_request',
+        session_id: sessionId,
+        chat_id: String(msgRes.chat.id),
+        cwd,
+        project_label: label
+      });
+      appendHistory({ type: 'approval_request', session_id: sessionId, message_id: msgRes.message_id, cwd, project_label: label });
+    }
+  } catch (e) {
+    eprint('[telegram] failed to send approval request:', e.message);
+  }
+
+  // Support infinite timeout with 0 or negative values
+  const configTimeout = cfg().timeout_seconds;
+  const timeoutAction = cfg().timeout_action || 'deny';
+  const timeout = configTimeout === 0 || configTimeout === -1 ? 999999 : Number(configTimeout || DEFAULT_TIMEOUT);
+  const t0 = Date.now();
+  
+  // Use distributed polling instead of file-based approach
+  const hookId = `pretool-${approvalId}`;
+  
+  try {
+    // Create filter for messages relevant to this approval
+    const messageFilter = (update) => {
+      if (!update.callback_query) return false;
+      const data = update.callback_query.data || '';
+      return data.includes(approvalId);
+    };
+    
+    // Support infinite timeout with 0 or negative values
+    const shouldWaitForever = timeoutAction === 'wait';
+    const timeoutMs = shouldWaitForever ? 999999000 : timeout * 1000;
+    
+    eprint(`[${hookId}] Waiting for user response...`);
+    eprint(`📱 [afk] Check your Telegram for Approve/Deny options (timeout: ${timeout}s)`);
+    console.log(`[${hookId}] Waiting for user response...`);
+    console.log(`📱 [afk] Check your Telegram for Approve/Deny options (timeout: ${timeout}s)`);
+    
+    const update = await distributedTelegramPoll(messageFilter, hookId, timeoutMs);
+    
+    if (update && update.callback_query) {
+      const callbackData = update.callback_query.data || '';
+      
+      // Handle stop_wait first (can be from any session)
+      if (callbackData.startsWith('stop_wait:')) {
+        const stoppedSessionId = callbackData.split(':')[1];
+        clearReplyLock();
+        
+        try {
+          await tgApiWithToken(cfg().telegram_bot_token, 'answerCallbackQuery', { 
+            callback_query_id: update.callback_query.id,
+            text: 'Stopped waiting for reply'
+          });
+          
+          await tgApiWithToken(cfg().telegram_bot_token, 'editMessageReplyMarkup', {
+            chat_id: update.callback_query.message.chat.id,
+            message_id: update.callback_query.message.message_id,
+            reply_markup: JSON.stringify({ inline_keyboard: [[
+              { text: '🛑 Stopped waiting', callback_data: 'stopped' }
+            ]]})
+          });
+        } catch (e) {
+          eprint(`[${hookId}] Error handling stop_wait:`, e.message);
+        }
+        
+        // Exit without processing anything else
+        process.exit(0);
+      }
+      
+      // Parse callback data - debug what we actually received
+      debugLog('CALLBACK_PARSE', 'Parsing callback data', { callbackData });
+      
+      let decision, args = [];
+      if (callbackData.startsWith('approve:')) {
+        decision = 'approve';
+        args = callbackData.split(':').slice(1);
+      } else if (callbackData.startsWith('deny:')) {
+        decision = 'deny'; 
+        args = callbackData.split(':').slice(1);
+      } else if (callbackData.includes('allow_all')) {
+        decision = 'allow_all';
+        args = callbackData.split('|').slice(1);
+      } else if (callbackData.includes('ask_ui')) {
+        decision = 'ask_ui';
+      } else {
+        decision = 'unknown';
+      }
+      
+      debugLog('CALLBACK_PARSE', 'Parsed callback decision', { decision, args });
+      
+      // Log what command is being decided on
+      debugLog('APPROVAL_DECISION', 'Processing approval decision', {
+        decision,
+        toolName,
+        command: toolInput.command || 'N/A',
+        sessionId: sessionId?.substring(0, 8) + '...'
+      });
+      
+      // Handle the decision
+      if (decision === 'approve') {
+        removeActiveSession(sessionId);
+        appendHistory({ type: 'approval', session_id: sessionId, decision: 'approve', message_id: msgRes && msgRes.message_id });
+        
+        // Send callback acknowledgment
+        try {
+          await tgApiWithToken(cfg().telegram_bot_token, 'answerCallbackQuery', { 
+            callback_query_id: update.callback_query.id 
+          });
+          // Create approval summary with tool info
+          const toolCmd = toolInput.command || '';
+          const shortCmd = toolCmd.length > 50 ? toolCmd.substring(0, 50) + '...' : toolCmd;
+          const approvalText = `✅ *Approved* — ${toolName}\n${shortCmd ? `\`${shortCmd}\`` : ''}`;
+          
+          await tgApiWithToken(cfg().telegram_bot_token, 'editMessageText', {
+            chat_id: update.callback_query.message.chat.id,
+            message_id: update.callback_query.message.message_id,
+            text: approvalText,
+            parse_mode: 'Markdown'
+          });
+        } catch (e) {
+          eprint(`[${hookId}] Error updating message:`, e.message);
+        }
+        
+        // Log approval to debug file only
+        
+        // Try multiple response formats to ensure Claude Code understands
+        const approvalResponse = {
+          decision: 'allow',
+          reason: 'Approved via Telegram',
+          hookSpecificOutput: {
+            hookEventName: 'PreToolUse',
+            permissionDecision: 'allow',
+            permissionDecisionReason: 'Approved via Telegram'
+          }
+        };
+        
+        debugLog('APPROVAL_RESPONSE', 'Sending approval to Claude Code', {
+          toolName,
+          command: toolInput.command || 'N/A',
+          response: approvalResponse
+        });
+        
+        process.stdout.write(JSON.stringify(approvalResponse));
+        process.stdout.write('\n'); // Ensure newline for proper parsing
+        
+        // Ensure the output is flushed before exiting
+        if (process.stdout.isTTY === false) {
+          process.stdout._flush && process.stdout._flush();
+        }
+        
+        debugLog('APPROVAL_RESPONSE', 'Hook response sent and flushed', { toolName });
+        return;
+        
+      } else if (decision === 'deny') {
+        removeActiveSession(sessionId);
+        appendHistory({ type: 'approval', session_id: sessionId, decision: 'deny', message_id: msgRes && msgRes.message_id });
+        
+        // Send callback acknowledgment
+        try {
+          await tgApiWithToken(cfg().telegram_bot_token, 'answerCallbackQuery', { 
+            callback_query_id: update.callback_query.id 
+          });
+          // Create denial summary with tool info
+          const toolCmd = toolInput.command || '';
+          const shortCmd = toolCmd.length > 50 ? toolCmd.substring(0, 50) + '...' : toolCmd;
+          const denialText = `❌ *Denied* — ${toolName}\n${shortCmd ? `\`${shortCmd}\`` : ''}`;
+          
+          await tgApiWithToken(cfg().telegram_bot_token, 'editMessageText', {
+            chat_id: update.callback_query.message.chat.id,
+            message_id: update.callback_query.message.message_id,
+            text: denialText,
+            parse_mode: 'Markdown'
+          });
+        } catch (e) {
+          eprint(`[${hookId}] Error updating message:`, e.message);
+        }
+        
+        // Log denial to debug file only
+        
+        process.stdout.write(JSON.stringify({
+          hookSpecificOutput: {
+            hookEventName: 'PreToolUse',
+            permissionDecision: 'deny',
+            permissionDecisionReason: 'Denied via Telegram'
+          }
+        }));
+        return;
+        
+      } else if (decision === 'allow_all') {
+        removeActiveSession(sessionId);
+        // Clean up metadata file if it exists
+        const metaFile = path.join(APPROVAL_DIR, `${approvalId}.meta`);
+        try { if (fs.existsSync(metaFile)) fs.unlinkSync(metaFile); } catch (_) {}
+        
+        const patternsForAllowAll = args[0] ? [args[0]] : generatePermissionPattern(toolName, toolInput);
+        const patternArray = Array.isArray(patternsForAllowAll) ? patternsForAllowAll : [patternsForAllowAll];
+        
+        let addedCount = 0;
+        let skippedCount = 0;
+        for (const pattern of patternArray) {
+          const added = addPermissionToSettings(pattern, cwd);
+          if (added) addedCount++;
+          else skippedCount++;
+        }
+        
+        const patternText = patternArray.length > 1 ? 
+          `${patternArray.length} patterns` : 
+          `pattern "${patternArray[0]}"`;
+        
+        const reasonText = addedCount > 0 ? 
+          `Approved via Telegram and added ${addedCount} new ${addedCount === 1 ? 'pattern' : 'patterns'} to permissions` +
+          (skippedCount > 0 ? ` (${skippedCount} already existed)` : '') :
+          `Approved via Telegram (${patternText} already exists)`;
+        
+        // Send callback acknowledgment and update message
+        try {
+          await tgApiWithToken(cfg().telegram_bot_token, 'answerCallbackQuery', { 
+            callback_query_id: update.callback_query.id 
+          });
+          
+          const toolCmd = toolInput.command || '';
+          const shortCmd = toolCmd.length > 50 ? toolCmd.substring(0, 50) + '...' : toolCmd;
+          const resultText = `✅ *Allowed All* — ${toolName}\n${shortCmd ? `\`${shortCmd}\`` : ''}\n\nAdded ${addedCount} new ${addedCount === 1 ? 'pattern' : 'patterns'} to permissions` +
+            (skippedCount > 0 ? ` (${skippedCount} already existed)` : '');
+          
+          await tgApiWithToken(cfg().telegram_bot_token, 'editMessageText', {
+            chat_id: update.callback_query.message.chat.id,
+            message_id: update.callback_query.message.message_id,
+            text: resultText,
+            parse_mode: 'Markdown'
+          });
+        } catch (e) {
+          eprint(`[${hookId}] Error updating message:`, e.message);
+        }
+        
+        appendHistory({ type: 'approval', session_id: sessionId, decision: 'allow_all', patterns: patternArray, message_id: msgRes && msgRes.message_id });
+        process.stdout.write(JSON.stringify({
+          hookSpecificOutput: {
+            hookEventName: 'PreToolUse',
+            permissionDecision: 'allow',
+            permissionDecisionReason: reasonText
+          }
+        }));
+        return;
+        
+      } else if (decision === 'ask_ui') {
+        removeActiveSession(sessionId);
+        // Send callback acknowledgment
+        try {
+          await tgApiWithToken(cfg().telegram_bot_token, 'answerCallbackQuery', { 
+            callback_query_id: update.callback_query.id 
+          });
+          // Create delegation message with tool info
+          const toolCmd = toolInput.command || '';
+          const shortCmd = toolCmd.length > 50 ? toolCmd.substring(0, 50) + '...' : toolCmd;
+          const delegateText = `🔧 *Delegating to Claude UI* — ${toolName}\n${shortCmd ? `\`${shortCmd}\`` : ''}`;
+          
+          await tgApiWithToken(cfg().telegram_bot_token, 'editMessageText', {
+            chat_id: update.callback_query.message.chat.id,
+            message_id: update.callback_query.message.message_id,
+            text: delegateText,
+            parse_mode: 'Markdown'
+          });
+        } catch (e) {
+          eprint(`[${hookId}] Error updating message:`, e.message);
+        }
+        
+        appendHistory({ type: 'approval', session_id: sessionId, decision: 'ask_ui', message_id: msgRes && msgRes.message_id });
+        process.stdout.write(JSON.stringify({
+          hookSpecificOutput: {
+            hookEventName: 'PreToolUse',
+            permissionDecision: 'ask',
+            permissionDecisionReason: 'Delegating to Claude UI for decision'
+          }
+        }));
+        return;
+      }
+    }
+    
+    // If we get here, it means timeout occurred or no callback was received
+    // Update Telegram message to show timeout status
+    if (msgRes && msgRes.message_id) {
+      try {
+        const { telegram_chat_id: chatId, telegram_bot_token: token } = cfg();
+        const timeoutMsg = timeoutAction === 'wait' 
+          ? `⏰ *Timed out* — Waiting for response...\n${summary}\n\n_Session:_ \`${shortSession(sessionId)}\``
+          : timeoutAction === 'allow'
+          ? `⏰ *Timed out* — Auto-approved after ${timeout}s\n${summary}\n\n_Session:_ \`${shortSession(sessionId)}\``
+          : `⏰ *Timed out* — Auto-denied after ${timeout}s\n${summary}\n\n_Session:_ \`${shortSession(sessionId)}\``;
+          
+        await tgApiWithToken(token, 'editMessageText', {
+          chat_id: chatId,
+          message_id: msgRes.message_id,
+          text: timeoutMsg,
+          parse_mode: 'Markdown'
+        });
+      } catch (e) {
+        eprint('[timeout] Failed to update Telegram message:', e.message);
+      }
+    }
+    
+    // Handle timeout based on configured action
+    if (timeoutAction === 'allow') {
+      removeActiveSession(sessionId);
+      appendHistory({ type: 'approval', session_id: sessionId, decision: 'timeout_allow', message_id: msgRes && msgRes.message_id });
+      process.stdout.write(JSON.stringify({
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse',
+          permissionDecision: 'allow',
+          permissionDecisionReason: `Auto-approved after ${timeout}s timeout`
+        }
+      }));
+      return;
+    } else if (timeoutAction === 'deny') {
+      removeActiveSession(sessionId);
+      appendHistory({ type: 'approval', session_id: sessionId, decision: 'timeout_deny', message_id: msgRes && msgRes.message_id });
+      process.stdout.write(JSON.stringify({
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse',
+          permissionDecision: 'deny',
+          permissionDecisionReason: `Auto-denied after ${timeout}s timeout`
+        }
+      }));
+      return;
+    }
+    
+    // For 'wait' mode, timeout should return 'ask' to let Claude UI handle it
+    process.stdout.write(JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: 'PreToolUse',
+        permissionDecision: 'ask',
+        permissionDecisionReason: 'Telegram timeout - delegating to Claude UI'
+      }
+    }));
+    
+  } catch (error) {
+    eprint(`[${hookId}] Error in distributed polling:`, error.message);
+    
+    // On error, delegate to Claude UI
+    process.stdout.write(JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: 'PreToolUse',
+        permissionDecision: 'ask',
+        permissionDecisionReason: `Telegram polling error: ${error.message}`
+      }
+    }));
+  }
+}
+
+// Notification hook removed - redundant with PreToolUse
+
+async function hookStop() {
+  const data = await readStdinJson();
+  const sessionId = data.session_id;
+  
+  // Always log that we're triggered - this is critical for debugging
+  eprint(`🏁 [afk] Stop hook triggered (session: ${sessionId?.substring(0, 8)}...)`);
+  console.log(`🏁 [afk] Stop hook triggered (session: ${sessionId?.substring(0, 8)}...)`);
+  process.stderr.write(`🏁 [afk] Stop hook triggered (session: ${sessionId?.substring(0, 8)}...)\n`);
+  
+  // Log stop_hook_active for debugging but always proceed normally
+  if (data.stop_hook_active !== undefined) {
+    eprint(`📊 [afk] stop_hook_active=${data.stop_hook_active} (ignoring - always send message)`);
+    console.log(`📊 [afk] stop_hook_active=${data.stop_hook_active} (ignoring - always send message)`);
+    process.stderr.write(`📊 [afk] stop_hook_active=${data.stop_hook_active} (always sending Agent finished)\n`);
+  }
+  
+  debugLog('HOOK_STOP', 'Stop hook triggered', {
+    sessionId,
+    cwd: data.cwd,
+    transcript_path: data.transcript_path,
+    stop_hook_active: data.stop_hook_active
+  });
+
+  // In local mode, don't interfere - just allow normal stopping
+  const mode = readMode();
+  if (mode !== 'remote') {
+    debugLog('HOOK_STOP', 'Local mode - allowing normal stop', {
+      mode,
+      decision: 'allow',
+      reason: 'local mode active'
+    });
+    eprint(`[afk] Local mode - allowing normal stop`);
+    process.stdout.write(JSON.stringify({}));
+    return;
+  }
+  
+  // Clean up any tracked sessions for this session ID
+  removeActiveSession(sessionId);
+  
+  const cwd = data.cwd;
+  const label = projectLabel(cwd);
+  
+  // Extract conversation context to show what the agent accomplished
+  const context = extractConversationContext(data.transcript_path, 15);
+  
+  // Build context section showing recent conversation
+  let contextSection = '';
+  if (context.recentMessages && context.recentMessages.length > 0 && !context.error) {
+    contextSection += `\n\n💬 **What happened:**`;
+    
+    // Show last few messages but truncate to avoid Telegram's 4096 char limit
+    const messagesToShow = context.recentMessages.slice(-3); // Reduce from 5 to 3
+    for (const msg of messagesToShow) {
+      const roleIcon = msg.role === 'user' ? '👤' : '🤖';
+      // Truncate individual messages to prevent overflow
+      const truncatedText = msg.text.length > 200 ? msg.text.substring(0, 200) + '...' : msg.text;
+      contextSection += `\n${roleIcon} ${truncatedText}`;
+    }
+  } else if (context.lastAssistantMessage) {
+    // Truncate last assistant message
+    const truncatedText = context.lastAssistantMessage.text.length > 300 
+      ? context.lastAssistantMessage.text.substring(0, 300) + '...' 
+      : context.lastAssistantMessage.text;
+    contextSection += `\n\n🤖 **Last action:** ${truncatedText}`;
+  }
+  
+  // Ensure total message doesn't exceed Telegram's limit
+  const baseMessage = `✅ *Agent finished* — ${label}`;
+  const footer = `\n\n_Session:_ \`${shortSession(sessionId)}\`\n\n**What next?**\n• Tap *Reply* to send a follow-up task\n• Tap *Finish* to close this session`;
+  
+  // Truncate context if needed to stay under 4000 chars (safe margin)
+  const maxContextLength = 4000 - baseMessage.length - footer.length;
+  if (contextSection.length > maxContextLength) {
+    contextSection = contextSection.substring(0, maxContextLength - 3) + '...';
+  }
+  
+  const text = baseMessage + contextSection + footer;
+  
+  const keyboard = { inline_keyboard: [[
+    { text: '💬 Reply', callback_data: `reply:${sessionId}` },
+    { text: '✅ Finish', callback_data: `finish:${sessionId}` }
+  ]] };
+  let msgRes = null;
+  try {
+    msgRes = await sendTelegramMessage(text, keyboard);
+    if (msgRes && msgRes.message_id && msgRes.chat) {
+      rememberMessageMapping(msgRes.message_id, {
+        kind: 'stop_notice',
+        session_id: sessionId,
+        chat_id: String(msgRes.chat.id),
+        cwd,
+        project_label: label
+      });
+      appendHistory({ type: 'stop_notice', session_id: sessionId, message_id: msgRes.message_id, cwd, project_label: label });
+    }
+  } catch (e) {
+    eprint('[telegram] failed to send stop notice:', e.message);
+  }
+
+  // Block and wait for user interaction, just like PreToolUse hook does
+  const timeout = Number(process.env.AFK_STOP_TIMEOUT || process.env.CC_REMOTE_STOP_TIMEOUT || 21600);
+  if (process.env.CC_REMOTE_STOP_TIMEOUT) {
+    eprint('[afk] Warning: CC_REMOTE_STOP_TIMEOUT is deprecated, use AFK_STOP_TIMEOUT instead');
+  }
+  const hookId = `stop-${sessionId}`;
+  
+  try {
+    // Create filter for messages relevant to this session
+    const messageFilter = (update) => {
+      if (update.callback_query) {
+        const data = update.callback_query.data || '';
+        return data.startsWith('reply:' + sessionId) || data.startsWith('finish:' + sessionId);
+      }
+      // Also listen for text messages for this session
+      if (update.message && update.message.text && !update.message.text.startsWith('/')) {
+        const chatId = String(update.message.chat.id);
+        const { telegram_chat_id } = cfg();
+        return chatId === String(telegram_chat_id);
+      }
+      return false;
+    };
+    
+    eprint(`🛑 [afk] Stop hook waiting for user response...`);
+    eprint(`📱 [afk] Check your Telegram for Reply/Finish options (timeout: ${timeout}s)`);
+    console.log(`🛑 [afk] Stop hook waiting for user response...`);
+    console.log(`📱 [afk] Check your Telegram for Reply/Finish options (timeout: ${timeout}s)`);
+    
+    const update = await distributedTelegramPoll(messageFilter, hookId, timeout * 1000);
+    
+    if (update && update.callback_query) {
+      const callbackData = update.callback_query.data || '';
+      
+      if (callbackData.startsWith('stop_wait:')) {
+        // User wants to stop waiting - clear the reply lock
+        const stoppedSessionId = callbackData.split(':')[1];
+        clearReplyLock();
+        
+        try {
+          await tgApiWithToken(cfg().telegram_bot_token, 'answerCallbackQuery', { 
+            callback_query_id: update.callback_query.id,
+            text: 'Stopped waiting for reply'
+          });
+          
+          // Update buttons to show we stopped
+          await tgApiWithToken(cfg().telegram_bot_token, 'editMessageReplyMarkup', {
+            chat_id: update.callback_query.message.chat.id,
+            message_id: update.callback_query.message.message_id,
+            reply_markup: JSON.stringify({ inline_keyboard: [[
+              { text: '🛑 Stopped waiting', callback_data: 'stopped' }
+            ]]})
+          });
+        } catch (e) {
+          eprint(`[${hookId}] Error handling stop_wait:`, e.message);
+        }
+        
+        // Exit cleanly without injecting any message
+        process.exit(0);
+      }
+      
+      if (callbackData.startsWith('reply:')) {
+        // User wants to continue - wait for their text message
+        // First clear any existing lock and set new one for this session
+        try {
+          await tgApiWithToken(cfg().telegram_bot_token, 'answerCallbackQuery', { 
+            callback_query_id: update.callback_query.id 
+          });
+          
+          // Clear any existing lock first, then set new one for this session
+          clearReplyLock();
+          setReplyLock(sessionId, update.callback_query.message.message_id);
+          
+          // Update buttons with Stop Waiting option
+          await tgApiWithToken(cfg().telegram_bot_token, 'editMessageReplyMarkup', {
+            chat_id: update.callback_query.message.chat.id,
+            message_id: update.callback_query.message.message_id,
+            reply_markup: JSON.stringify({ inline_keyboard: [[
+              { text: '⏳ Waiting for your reply...', callback_data: 'waiting' },
+              { text: '🛑 Stop Waiting', callback_data: `stop_wait:${sessionId}` }
+            ]]})
+          });
+        } catch (e) {
+          eprint(`[${hookId}] Error updating message:`, e.message);
+        }
+        
+        // Wait for text message - but prefer replies to our specific message
+        eprint(`⌨️  [afk] Now waiting for your text message...`);
+        console.log(`⌨️  [afk] Now waiting for your text message...`);
+        
+        // Store the message ID we're waiting for a reply to
+        const waitingForReplyTo = update.callback_query.message.message_id;
+        
+        // Create a more specific filter for text messages with session locking
+        const textMessageFilter = (updateToCheck) => {
+          if (updateToCheck.message && updateToCheck.message.text && !updateToCheck.message.text.startsWith('/')) {
+            const chatId = String(updateToCheck.message.chat.id);
+            const { telegram_chat_id } = cfg();
+            
+            // Only process messages from our configured chat
+            if (chatId !== String(telegram_chat_id)) {
+              return false;
+            }
+            
+            // Use session locking to prevent cross-session message stealing
+            if (!isMyMessage(sessionId, updateToCheck.message)) {
+              return false;
+            }
+            
+            // Prefer replies to our specific message
+            if (updateToCheck.message.reply_to_message && 
+                updateToCheck.message.reply_to_message.message_id === waitingForReplyTo) {
+              eprint(`[${hookId}] Got reply to our specific message`);
+              clearReplyLock(); // Clear lock since we got the expected reply
+              return true;
+            }
+            
+            // Also accept general text messages if we own them via lock
+            eprint(`[${hookId}] Got text message for our session`);
+            clearReplyLock(); // Clear lock since we got a message
+            return true;
+          }
+          return false;
+        };
+        
+        const textUpdate = await distributedTelegramPoll(textMessageFilter, hookId + '-text', timeout * 1000);
+        
+        if (textUpdate && textUpdate.message && textUpdate.message.text) {
+          const userText = textUpdate.message.text;
+          eprint(`💬 [afk] Stop hook: Got user message, continuing conversation`);
+          
+          // Just update buttons to show we got the message
+          try {
+            await tgApiWithToken(cfg().telegram_bot_token, 'editMessageReplyMarkup', {
+              chat_id: update.callback_query.message.chat.id,
+              message_id: update.callback_query.message.message_id,
+              reply_markup: JSON.stringify({ inline_keyboard: [[
+                { text: `💬 Received: "${userText.substring(0, 30)}${userText.length > 30 ? '...' : ''}"`, callback_data: 'received' }
+              ]]})
+            });
+          } catch (e) {
+            eprint(`[${hookId}] Error updating message:`, e.message);
+          }
+          
+          appendHistory({ type: 'reply', session_id: sessionId, text: userText });
+          eprint(`✅ [afk] Stop hook completed - injecting user message into conversation`);
+          
+          // User clicked Reply - they want to continue with their message
+          // Inject the message and let Claude continue
+          process.stderr.write(`User replied via Telegram: "${userText}". Continue the conversation with this input.`);
+          process.exit(2);
+        }
+        
+      } else if (callbackData.startsWith('finish:')) {
+        // User wants to finish - allow Claude to stop
+        try {
+          await tgApiWithToken(cfg().telegram_bot_token, 'answerCallbackQuery', { 
+            callback_query_id: update.callback_query.id 
+          });
+          // Just update buttons to show session finished
+          await tgApiWithToken(cfg().telegram_bot_token, 'editMessageReplyMarkup', {
+            chat_id: update.callback_query.message.chat.id,
+            message_id: update.callback_query.message.message_id,
+            reply_markup: JSON.stringify({ inline_keyboard: [[
+              { text: '✅ Session finished', callback_data: 'finished' }
+            ]]})
+          });
+        } catch (e) {
+          eprint(`[${hookId}] Error updating message:`, e.message);
+        }
+        
+        appendHistory({ type: 'finish', session_id: sessionId });
+        eprint(`✅ [afk] Stop hook completed - session finished`);
+        
+        // Return JSON to allow Claude to stop normally
+        // For Stop hooks, omitting 'decision' allows normal stopping
+        process.stdout.write(JSON.stringify({}));
+        return;
+      }
+      
+    } else if (update && update.message && update.message.text) {
+      // Direct text message - continue conversation
+      const userText = update.message.text;
+      eprint(`💬 [afk] Stop hook: Got direct message, continuing conversation`);
+      
+      // Try to update buttons on the most recent stop message if we have one
+      if (msgRes && msgRes.message_id && msgRes.chat) {
+        try {
+          await tgApiWithToken(cfg().telegram_bot_token, 'editMessageReplyMarkup', {
+            chat_id: msgRes.chat.id,
+            message_id: msgRes.message_id,
+            reply_markup: JSON.stringify({ inline_keyboard: [[
+              { text: `💬 Received: "${userText.substring(0, 30)}${userText.length > 30 ? '...' : ''}"`, callback_data: 'received' }
+            ]]})
+          });
+        } catch (e) {
+          eprint(`[${hookId}] Error updating message:`, e.message);
+        }
+      }
+      
+      appendHistory({ type: 'reply', session_id: sessionId, text: userText });
+      eprint(`✅ [afk] Stop hook completed - injecting user message into conversation`);
+      
+      // Direct text message - inject it and continue
+      process.stderr.write(`The user has sent a message via Telegram: "${userText}". Please respond to this user input and continue the conversation.`);
+      process.exit(2);
+    }
+    
+    // Timeout - allow Claude to finish
+    eprint(`⏰ [afk] Stop hook timed out - allowing Claude to finish`);
+    
+    // Return JSON to allow Claude to stop normally on timeout
+    // For Stop hooks, omitting 'decision' allows normal stopping
+    process.stdout.write(JSON.stringify({}));
+    return;
+    
+  } catch (error) {
+    eprint(`[${hookId}] Error in polling:`, error.message);
+    
+    // Return JSON to allow Claude to stop on error
+    // For Stop hooks, omitting 'decision' allows normal stopping
+    process.stdout.write(JSON.stringify({}));
+    return;
+  }
+}
+
+// ---------------------------
+// Telegram bot (long polling)
+// ---------------------------
+async function telegramBot() {
+  const c = cfg();
+  const token = c.telegram_bot_token;
+  const chatId = String(c.telegram_chat_id || '');
+  if (!token || !chatId) {
+    eprint('Bot requires telegram_bot_token and telegram_chat_id in ~/.claude-remote/config.json');
+    process.exit(1);
+  }
+  let offset = 0;
+  const pending = new Map(); // chatId -> sessionId awaiting text
+
+  function api(method, params) { return tgApiWithToken(token, method, params).catch(err => { eprint('[tgApi]', err.message); }); }
+
+  async function loop() {
+    while (true) {
+      try {
+        const updates = await tgApiWithToken(token, 'getUpdates', { timeout: 50, offset, allowed_updates: JSON.stringify(['message','callback_query']) }, { timeoutMs: 60000 });
+        for (const u of updates) {
+          offset = u.update_id + 1;
+          if (u.callback_query) await handleCallback(u.callback_query);
+          if (u.message) await handleMessage(u.message);
+        }
+      } catch (e) {
+        eprint('[bot] polling error:', e.message);
+        await new Promise(r => setTimeout(r, 2000));
+      }
+    }
+  }
+
+  async function handleCallback(q) {
+    const chat = String(q.message && q.message.chat && q.message.chat.id);
+    const data = String(q.data || '');
+    
+    // Debug logging for callbacks
+    eprint(`[callback] Received: ${data} from chat ${chat}`);
+    
+    await api('answerCallbackQuery', { callback_query_id: q.id });
+    if (chat !== chatId) return; // ignore other chats
+    
+    // Handle basic approve/deny
+    if (data.startsWith('approve:') || data.startsWith('deny:')) {
+      const [action, id] = data.split(':');
+      ensureDir(APPROVAL_DIR);
+      fs.writeFileSync(path.join(APPROVAL_DIR, id), action);
+      
+      // Try to get metadata for better approval message
+      let approvalText = action === 'approve' ? '✅ Approved' : '❌ Denied';
+      try {
+        const metaFile = path.join(APPROVAL_DIR, `${id}.meta`);
+        if (fs.existsSync(metaFile)) {
+          const meta = JSON.parse(fs.readFileSync(metaFile, 'utf8'));
+          const toolName = meta.toolName || 'Unknown';
+          const toolCmd = meta.toolInput?.command || '';
+          const shortCmd = toolCmd.length > 50 ? toolCmd.substring(0, 50) + '...' : toolCmd;
+          approvalText = action === 'approve' 
+            ? `✅ *Approved* — ${toolName}\n${shortCmd ? `\`${shortCmd}\`` : ''}` 
+            : `❌ *Denied* — ${toolName}\n${shortCmd ? `\`${shortCmd}\`` : ''}`;
+        }
+      } catch (e) {
+        // Fallback to basic message if metadata read fails
+      }
+      
+      await api('editMessageText', {
+        chat_id: chatId,
+        message_id: q.message.message_id,
+        text: approvalText,
+        parse_mode: 'Markdown'
+      });
+      const map = lookupSessionByMessageId(q.message.message_id);
+      if (map && map.session_id) appendHistory({ type: 'approval', session_id: map.session_id, decision: action, message_id: q.message.message_id });
+      return;
+    }
+    
+    // Handle Allow All
+    if (data.startsWith('allow_all:')) {
+      const [, id] = data.split(':');
+      ensureDir(APPROVAL_DIR);
+      
+      // Read patterns from metadata file (stored separately due to Telegram's 64-byte limit)
+      const metaFile = path.join(APPROVAL_DIR, `${id}.meta`);
+      let patterns = ['unknown'];
+      let meta = {};
+      try {
+        if (fs.existsSync(metaFile)) {
+          meta = JSON.parse(fs.readFileSync(metaFile, 'utf8'));
+          patterns = meta.patterns || meta.pattern || 'unknown';
+          if (!Array.isArray(patterns)) patterns = [patterns];
+          fs.unlinkSync(metaFile); // Clean up metadata file
+        }
+      } catch (e) {
+        eprint('[allow_all] Failed to read metadata:', e.message);
+      }
+      
+      // Add all patterns to settings
+      let addedCount = 0;
+      let skippedCount = 0;
+      for (const pattern of patterns) {
+        const added = addPermissionToSettings(pattern, meta.cwd || process.cwd());
+        if (added) addedCount++;
+        else skippedCount++;
+      }
+      
+      const patternText = patterns.length > 3 ? 
+        `${patterns.slice(0, 3).join('`, `')}... (+${patterns.length - 3} more)` :
+        patterns.join('`, `');
+      
+      // Include tool info in Allow All message
+      let toolInfo = '';
+      try {
+        const metaFile = path.join(APPROVAL_DIR, `${id}.meta`);
+        if (fs.existsSync(metaFile)) {
+          const meta = JSON.parse(fs.readFileSync(metaFile, 'utf8'));
+          const toolName = meta.toolName || 'Unknown';
+          const toolCmd = meta.toolInput?.command || '';
+          const shortCmd = toolCmd.length > 50 ? toolCmd.substring(0, 50) + '...' : toolCmd;
+          toolInfo = ` — ${toolName}\n${shortCmd ? `\`${shortCmd}\`` : ''}\n\n`;
+        }
+      } catch (e) {
+        // Continue without tool info if metadata read fails
+      }
+      
+      const resultText = addedCount > 0 ?
+        `✅ *Allowed All*${toolInfo}Added ${addedCount} new ${addedCount === 1 ? 'pattern' : 'patterns'} to permissions${skippedCount > 0 ? ` (${skippedCount} already existed)` : ''}:\n\`${patternText}\`` :
+        `✅ *Allowed All*${toolInfo}${patterns.length === 1 ? 'Pattern' : 'Patterns'} already existed:\n\`${patternText}\``;
+      
+      fs.writeFileSync(path.join(APPROVAL_DIR, id), `allow_all|${patterns.join(',')}`);
+      
+      try {
+        await api('editMessageText', {
+          chat_id: chatId,
+          message_id: q.message.message_id,
+          text: resultText,
+          parse_mode: 'Markdown'
+        });
+      } catch (e) {
+        eprint('[allow_all] Failed to update message:', e.message);
+        // Fallback: try to send a new message
+        try {
+          await api('sendMessage', {
+            chat_id: chatId,
+            text: `${resultText}\n\n_Original message update failed_`,
+            parse_mode: 'Markdown'
+          });
+        } catch (e2) {
+          eprint('[allow_all] Failed to send fallback message:', e2.message);
+        }
+      }
+      const map = lookupSessionByMessageId(q.message.message_id);
+      if (map && map.session_id) appendHistory({ type: 'approval', session_id: map.session_id, decision: 'allow_all', patterns, message_id: q.message.message_id });
+      return;
+    }
+    
+    // Handle Ask UI
+    if (data.startsWith('ask_ui:')) {
+      const [, id] = data.split(':');
+      ensureDir(APPROVAL_DIR);
+      fs.writeFileSync(path.join(APPROVAL_DIR, id), 'ask_ui');
+      
+      // Try to get metadata for better delegation message
+      let delegateText = '🔧 Delegating to Claude UI';
+      try {
+        const metaFile = path.join(APPROVAL_DIR, `${id}.meta`);
+        if (fs.existsSync(metaFile)) {
+          const meta = JSON.parse(fs.readFileSync(metaFile, 'utf8'));
+          const toolName = meta.toolName || 'Unknown';
+          const toolCmd = meta.toolInput?.command || '';
+          const shortCmd = toolCmd.length > 50 ? toolCmd.substring(0, 50) + '...' : toolCmd;
+          delegateText = `🔧 *Delegating to Claude UI* — ${toolName}\n${shortCmd ? `\`${shortCmd}\`` : ''}`;
+        }
+      } catch (e) {
+        // Fallback to basic message if metadata read fails
+      }
+      
+      await api('editMessageText', {
+        chat_id: chatId,
+        message_id: q.message.message_id,
+        text: delegateText,
+        parse_mode: 'Markdown'
+      });
+      const map = lookupSessionByMessageId(q.message.message_id);
+      if (map && map.session_id) appendHistory({ type: 'approval', session_id: map.session_id, decision: 'ask_ui', message_id: q.message.message_id });
+      return;
+    }
+    if (data.startsWith('reply:')) {
+      const [, session] = data.split(':');
+      pending.set(chatId, session);
+      setLatestSessionForChat(chatId, session);
+      await api('editMessageText', { 
+        chat_id: chatId, 
+        message_id: q.message.message_id, 
+        text: `💬 *Waiting for your follow-up*\n_Session:_ \`${shortSession(session)}\`\n\n**Send your message now** to continue the conversation with Claude.\n\n_The session will wait for your input - no timeout._`, 
+        parse_mode: 'Markdown' 
+      });
+      return;
+    }
+    if (data.startsWith('cont:')) {
+      const [, session] = data.split(':');
+      const [ok, out] = runClaudeResume(session, 'Please continue.');
+      await api('editMessageText', { chat_id: chatId, message_id: q.message.message_id, text: ok ? `▶️ Continued.\n\n${out}` : `⚠️ ${out}` });
+      const map = lookupSessionByMessageId(q.message.message_id);
+      const sid = map && map.session_id ? map.session_id : session;
+      appendHistory({ type: 'continue', session_id: sid, message_id: q.message.message_id });
+      setLatestSessionForChat(chatId, sid);
+      return;
+    }
+    
+    // Handle Finish button - user wants to close the session
+    if (data.startsWith('finish:')) {
+      const [, session] = data.split(':');
+      
+      try {
+        await api('editMessageText', { 
+          chat_id: chatId, 
+          message_id: q.message.message_id, 
+          text: `✅ *Session finished*\n_Session:_ \`${shortSession(session)}\`\n\nThe agent task is complete. You can start a new conversation anytime!`,
+          parse_mode: 'Markdown'
+        });
+      } catch (e) {
+        eprint('[finish] Failed to update message:', e.message);
+        // Fallback: send a new message
+        try {
+          await api('sendMessage', {
+            chat_id: chatId,
+            text: `✅ *Session finished*\n_Session:_ \`${shortSession(session)}\`\n\nThe agent task is complete. You can start a new conversation anytime!\n\n_Original message update failed_`,
+            parse_mode: 'Markdown'
+          });
+        } catch (e2) {
+          eprint('[finish] Failed to send fallback message:', e2.message);
+        }
+      }
+      
+      const map = lookupSessionByMessageId(q.message.message_id);
+      const sid = map && map.session_id ? map.session_id : session;
+      appendHistory({ type: 'finish', session_id: sid, message_id: q.message.message_id });
+      return;
+    }
+  }
+
+  async function handleMessage(m) {
+    const chat = String(m.chat && m.chat.id);
+    if (chat !== chatId) return;
+    const text = m.text || '';
+    if (!text || text.startsWith('/')) return;
+
+    let session = null;
+    if (m.reply_to_message && m.reply_to_message.message_id) {
+      const map = lookupSessionByMessageId(m.reply_to_message.message_id);
+      if (map && map.session_id) session = map.session_id;
+    }
+    if (!session && pending.has(chatId)) {
+      session = pending.get(chatId);
+      pending.delete(chatId);
+    }
+    if (!session) {
+      session = getLatestSessionForChat(chatId);
+    }
+
+    if (session) {
+      appendHistory({ type: 'reply', session_id: session, message_id: m.message_id, text });
+      setLatestSessionForChat(chatId, session);
+      const [ok, out] = runClaudeResume(session, text);
+      await api('sendMessage', { chat_id: chatId, text: ok ? out : `⚠️ ${out}` });
+    } else {
+      await api('sendMessage', { chat_id: chatId, text: '⚠️ No recent session found. Tap Reply on a session message or run a tool to create one.' });
+    }
+  }
+
+  console.log('afk bot: polling…');
+  loop();
+}
+
+// ---------------------------
+// Installer / Uninstaller
+// ---------------------------
+function install(scope, projectRoot) {
+  if (scope === 'user') {
+    ensureDir(USER_BIN);
+    const dest = path.join(USER_BIN, 'afk');
+    fs.copyFileSync(process.argv[1], dest);
+    ensureExecutable(dest);
+    const settingsPath = writeSettings('user');
+    console.log(`[afk] Installed hooks at user level: ${settingsPath}`);
+    console.log('[afk] Next: in Claude Code, run `/hooks` to approve.');
+    console.log('[afk] Tip: start the bot with `afk telegram start-bot` and switch modes with `afk on|off`.');
+  } else {
+    if (!projectRoot) {
+      eprint('--project-root is required for project/local install');
+      process.exit(2);
+    }
+    const pr = path.resolve(projectRoot);
+    const settingsPath = writeSettings(scope, pr);
+    console.log(`[afk] Installed hooks at ${scope} level: ${settingsPath}`);
+    console.log('[afk] Next: inside this project, run `/hooks` to approve.');
+    console.log('[afk] Tip: start the bot with `afk telegram start-bot` and switch modes with `afk on|off`.');
+  }
+}
+
+function uninstall(scope) {
+  if (scope === 'user') {
+    console.log('To uninstall, remove hook entries from ~/.claude/settings.json `hooks` section and delete ~/.claude-remote.');
+  } else {
+    console.log('To uninstall, remove hook entries from your project\'s .claude/settings(.local).json and delete ./.claude/hooks/afk');
+  }
+}
+
+function modeCmd(sub) {
+  debugLog('MODE_COMMAND', 'Processing mode command', { subcommand: sub, currentMode: readMode() });
+  const printExplained = (mode) => {
+    if (mode === 'remote') {
+      console.log('AFK mode: REMOTE — All permissioned tool calls require Telegram approval.');
+      console.log('Tip: start the bot with `afk telegram start-bot`. Switch back with `afk mode off`.');
+    } else {
+      console.log("AFK mode: LOCAL — Tools run with Claude's normal permission prompts.");
+      console.log('Tip: switch to REMOTE with `afk mode on` to require Telegram approvals.');
+    }
+  };
+
+  if (['on','remote'].includes(sub)) {
+    const oldMode = readMode();
+    writeMode('remote');
+    debugLog('MODE_CHANGE', 'Mode changed', {
+      oldMode,
+      newMode: 'remote',
+      trigger: 'mode_command'
+    });
+    printExplained('remote');
+  } else if (['off','local'].includes(sub)) {
+    const oldMode = readMode();
+    writeMode('local');
+    debugLog('MODE_CHANGE', 'Mode changed', {
+      oldMode,
+      newMode: 'local',
+      trigger: 'mode_command'
+    });
+    printExplained('local');
+  } else if (sub === 'toggle') {
+    const nm = readMode() === 'remote' ? 'local' : 'remote';
+    writeMode(nm);
+    printExplained(nm);
+  } else {
+    printExplained(readMode());
+  }
+}
+
+// ---------------------------
+// Helpers
+// ---------------------------
+function cryptoRandomId() {
+  // Simple UUID-ish (without importing crypto)
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+    const r = Math.random()*16|0; const v = c === 'x' ? r : (r&0x3|0x8); return v.toString(16);
+  });
+}
+
+// ---------------------------
+// CLI
+// ---------------------------
+function printHelp() {
+  console.log(
+`afk — Away From Keyboard + Telegram approvals\n\n` +
+`Smart Toggle:\n` +
+`  afk                    Smart toggle - installs if needed, otherwise toggles mode\n` +
+`\nDirect Commands:\n` +
+`  afk on                 Enable AFK mode (remote approvals)\n` +
+`  afk off                Disable AFK mode (local mode)\n` +
+`  afk toggle             Toggle between local and remote modes\n` +
+`  afk status             Show current AFK mode\n` +
+`\nFull Commands:\n` +
+`  install [--scope user|project|local] [--project-root PATH]\n` +
+`      Install Claude Code hooks at the chosen scope (prompts if omitted).\n` +
+`  setup\n` +
+`      Interactive wizard to link your Telegram bot and chat.\n` +
+`  uninstall --scope user|project|local [--project-root PATH]\n` +
+`      Print removal instructions for that scope.\n` +
+`  mode [on|off|toggle|local|remote|status]\n` +
+`      Switch between LOCAL (no remote approvals) and REMOTE (Telegram approvals).\n` +
+`  debug [on|off|status]\n` +
+`      Enable/disable persistent debug logging to ~/.claude-remote/debug.log\n` +
+`  telegram start-bot|test\n` +
+`      Start the long-polling bot or send a test message.\n` +
+`  inbox wait --session <id> [--timeout 21600]\n` +
+`      Wait locally for a \"reply\" or \"continue\" event for that session.\n` +
+`  hook pretooluse|stop|userpromptsubmit\n` +
+`      Internal entrypoints used by Claude Code hooks.\n` +
+`\nExamples:\n` +
+`  afk                    # Smart toggle: install or toggle mode\n` +
+`  afk on                 # Enable remote mode\n` +
+`  afk off                # Enable local mode\n` +
+`  afk install            # Install hooks\n` +
+`  afk telegram start-bot # Start Telegram bot\n`);
+}
+
+async function main() {
+  writeDefaultConfig();
+  const argv = process.argv.slice(2);
+  const cmd = argv[0];
+  
+  // Smart toggle behavior: no arguments
+  if (!cmd) { 
+    if (!isInstalled()) {
+      console.log("Run 'afk install' to set up hooks");
+      return;
+    }
+    // If installed, act like toggle command
+    modeCmd('toggle');
+    return;
+  }
+
+  if (cmd === 'install') {
+    const scopeIdx = argv.indexOf('--scope');
+    let scope = scopeIdx >= 0 ? argv[scopeIdx + 1] : null;
+    const prIdx = argv.indexOf('--project-root');
+    let projectRoot = prIdx >= 0 ? argv[prIdx + 1] : null;
+
+    if (!scope || !['user','project','local'].includes(scope)) {
+      console.log('No scope provided. Choose install scope:');
+      scope = await promptScope();
+    }
+    if ((scope === 'project' || scope === 'local') && !projectRoot) {
+      projectRoot = await promptProjectRoot();
+    }
+
+    // If config is incomplete, offer interactive setup first
+    const c = cfg();
+    if (!c.telegram_bot_token || !c.telegram_chat_id) {
+      console.log('Telegram not configured. Launching interactive setup...');
+      await setupInteractive();
+    }
+    install(scope, projectRoot);
+  } else if (cmd === 'uninstall') {
+    const scopeIdx = argv.indexOf('--scope');
+    const scope = scopeIdx >= 0 ? argv[scopeIdx + 1] : null;
+    if (!scope || !['user','project','local'].includes(scope)) { eprint('Missing or invalid --scope'); process.exit(2); }
+    uninstall(scope);
+  } else if (cmd === 'debug') {
+    const subcmd = argv[1];
+    const debugFile = path.join(USER_CFG_DIR, '.debug');
+    if (subcmd === 'on') {
+      fs.writeFileSync(debugFile, '1');
+      console.log('✅ Debug mode enabled persistently');
+      console.log('Debug log: ~/.claude-remote/debug.log');
+    } else if (subcmd === 'off') {
+      if (fs.existsSync(debugFile)) fs.unlinkSync(debugFile);
+      console.log('✅ Debug mode disabled');
+    } else {
+      const enabled = fs.existsSync(debugFile);
+      console.log(`Debug mode: ${enabled ? 'ENABLED' : 'DISABLED'}`);
+      if (enabled) console.log('Debug log: ~/.claude-remote/debug.log');
+    }
+  } else if (cmd === 'mode') {
+    modeCmd(argv[1] || 'status');
+  } else if (cmd === 'telegram') {
+    const action = argv[1];
+    if (action === 'start-bot') await telegramBot();
+    else if (action === 'test') {
+      const [ok, err] = await sendTelegram('afk test message');
+      console.log(ok ? 'Test message sent to Telegram.' : `Test failed: ${err}. Re-run \`afk setup\` to fix.`);
+    } else printHelp();
+  } else if (cmd === 'hook') {
+    const event = argv[1];
+    if (event === 'pretooluse') await hookPreToolUse();
+    else if (event === 'stop') await hookStop();
+    else printHelp();
+  } else if (cmd === 'setup') {
+    await setupInteractive();
+  } else if (cmd === 'inbox') {
+    const subcmd = argv[1];
+    if (subcmd === 'wait') {
+      const sidIdx = argv.indexOf('--session');
+      const sessionId = sidIdx >= 0 ? argv[sidIdx + 1] : null;
+      const toIdx = argv.indexOf('--timeout');
+      const timeout = toIdx >= 0 ? Number(argv[toIdx + 1]) : 21600;
+      if (!sessionId) { eprint('inbox wait requires --session <id>'); process.exit(2); }
+      const result = waitForInboxEvent({ sessionId, kinds: ['reply','continue'], timeout });
+      if (result) {
+        console.log(JSON.stringify(result));
+      } else {
+        console.log('null');
+        process.exit(1);
+      }
+    } else {
+      printHelp();
+    }
+  } else if (['on', 'off', 'toggle', 'status'].includes(cmd)) {
+    // Direct mode commands: afk on, afk off, afk toggle, afk status
+    modeCmd(cmd);
+  } else {
+    printHelp();
+  }
+}
+
+main().catch(e => { eprint('Fatal:', e.stack || e.message); process.exit(1); });
+
+// ---------------------------
+// Interactive setup
+// ---------------------------
+async function setupInteractive() {
+  console.log('afk interactive setup');
+  console.log('This will configure Telegram and write ~/.claude-remote/config.json');
+
+  const token = await promptLine('Enter Telegram bot token (from @BotFather): ', { mask: true });
+  if (!token) { console.log('Aborted: no token.'); return; }
+
+  // Validate token, get bot username
+  let me;
+  try {
+    me = await tgApiWithToken(token, 'getMe', {});
+  } catch (e) {
+    console.log(`Could not validate token: ${e.message}`);
+    return;
+  }
+  const botUsername = me.username ? `@${me.username}` : '(unknown)';
+  const link = me.username ? `https://t.me/${me.username}?start=afk` : 'Open your bot in Telegram and press Start';
+  console.log(`Bot verified as ${botUsername}`);
+
+  // Drain existing updates so we only watch for new messages
+  try {
+    const updates = await tgApiWithToken(token, 'getUpdates', { timeout: 0 }, { timeoutMs: 10000 });
+    if (Array.isArray(updates) && updates.length) {
+      const last = updates[updates.length - 1].update_id;
+      await tgApiWithToken(token, 'getUpdates', { offset: last + 1, timeout: 0 }, { timeoutMs: 10000 });
+    }
+  } catch (_) {}
+
+  console.log('Now link your chat:');
+  console.log(`  1) Open: ${link}`);
+  console.log('  2) Press Start and send any message to the bot.');
+  await promptLine('Press Enter after sending a message...');
+
+  let chatId = null;
+  const deadline = Date.now() + 120000; // up to 2 minutes
+  let offset = 0;
+  while (!chatId && Date.now() < deadline) {
+    try {
+      const updates = await tgApiWithToken(token, 'getUpdates', { timeout: 50, offset }, { timeoutMs: 60000 });
+      for (const u of updates) {
+        offset = u.update_id + 1;
+        const m = u.message;
+        if (m && m.chat && m.chat.type === 'private') {
+          chatId = String(m.chat.id);
+          break;
+        }
+      }
+    } catch (e) {
+      eprint('Polling error:', e.message);
+      await new Promise(r => setTimeout(r, 1000));
+    }
+  }
+
+  if (!chatId) {
+    console.log('Could not detect your chat automatically.');
+    const maybe = await promptLine('Paste your numeric chat ID (or leave empty to cancel): ');
+    if (maybe) chatId = maybe.trim();
+  }
+
+  if (!chatId) {
+    console.log('Aborted without chat ID. You can re-run `afk setup` later.');
+    return;
+  }
+
+  // Save config and test
+  const current = loadJson(USER_CFG, {});
+  current.telegram_bot_token = token;
+  current.telegram_chat_id = chatId;
+  current.timeout_seconds ||= DEFAULT_TIMEOUT;
+  current.timeout_action ||= DEFAULT_TIMEOUT_ACTION;
+  current.intercept_matcher ||= 'Bash|Edit|Write|MultiEdit|WebFetch|mcp__.*';
+  current.auto_approve_tools ||= ['Read'];
+  current.respect_claude_permissions = true;
+  saveJson(USER_CFG, current);
+
+  try {
+    await tgApiWithToken(token, 'sendMessage', { chat_id: chatId, text: '✅ afk is linked. You will receive approvals here.' });
+    console.log('Saved config and sent a test message.');
+  } catch (e) {
+    console.log(`Saved config, but failed to send test message: ${e.message}`);
+  }
+}
+
+function promptLine(question, opts = {}) {
+  const { mask = false } = opts;
+  const readline = require('readline');
+  let muted = false;
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: new (require('stream').Writable)({
+      write(chunk, encoding, cb) {
+        if (!mask || !muted) process.stdout.write(chunk, encoding);
+        else process.stdout.write('*'.repeat(String(chunk).length));
+        cb();
+      }
+    }),
+    terminal: true
+  });
+  return new Promise(resolve => {
+    rl.question(question, answer => { rl.close(); process.stdout.write('\n'); resolve(answer); });
+    if (mask) { muted = true; }
+  });
+}
+
+// ---------------------------
+// Local inbox wait (poll history)
+// ---------------------------
+function waitForInboxEvent({ sessionId, kinds = ['reply','continue'], timeout = 21600 }) {
+  const start = Date.now();
+  while (Date.now() - start < timeout * 1000) {
+    const events = readHistorySince(start, (ev) => ev.session_id === sessionId && kinds.includes(ev.type));
+    if (events.length) return events[0];
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1000); // sleep ~1s without busy loop
+  }
+  return null;
+}
+
+async function promptScope() {
+  console.log('  1) user   (applies everywhere)');
+  console.log('  2) project(checked in)');
+  console.log('  3) local  (project, not checked in)');
+  const ans = (await promptLine('Select 1/2/3 [1]: ')).trim();
+  if (ans === '2') return 'project';
+  if (ans === '3') return 'local';
+  return 'user';
+}
+
+async function promptProjectRoot() {
+  const def = process.cwd();
+  while (true) {
+    const p = (await promptLine(`Project root path [${def}]: `)).trim() || def;
+    try {
+      const abs = path.resolve(p);
+      if (fs.existsSync(abs)) return abs;
+      console.log('Path does not exist. Please try again.');
+    } catch (e) {
+      console.log('Invalid path. Please try again.');
+    }
+  }
+}

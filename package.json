@@ -1,0 +1,21 @@
+{
+  "name": "afk",
+  "version": "0.1.0",
+  "description": "afk - Away From Keyboard toggle + Telegram approvals for Claude Code",
+  "bin": {
+    "afk": "bin/afk"
+  },
+  "scripts": {
+    "test": "./test/run-tests.sh",
+    "test:permissions": "node test/test-permissions.js",
+    "test:integration": "node test/test-integration.js",
+    "test:syntax": "node -c bin/afk"
+  },
+  "type": "commonjs",
+  "private": true,
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=18"
+  }
+}
+

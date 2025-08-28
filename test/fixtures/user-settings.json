@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Edit|Write|MultiEdit|WebFetch|mcp__.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/leonidbugaev/.claude-remote/bin/afk hook pretooluse"
+          }
+        ]
+      }
+    ]
+  },
+  "permissions": {
+    "allow": [
+      "Read",
+      "Bash(ls:*)",
+      "Bash(cat:*)",
+      "Bash(echo:*)",
+      "Bash(pwd:*)",
+      "Bash(grep:*)",
+      "Bash(wc:*)",
+      "WebFetch(domain:docs.anthropic.com)",
+      "WebFetch(domain:github.com)",
+      "mcp__code-search__search_code"
+    ],
+    "deny": [
+      "Bash(rm:*)",
+      "Bash(sudo:*)",
+      "Bash(curl:*)",
+      "Write(*.env)",
+      "Write(*.secret)",
+      "WebFetch(domain:suspicious.com)"
+    ]
+  }
+}
