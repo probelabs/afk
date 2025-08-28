@@ -1,6 +1,6 @@
-# Contributing to afk-claude
+# Contributing to @probelabs/afk
 
-Thank you for your interest in contributing to afk-claude! This document provides guidelines and instructions for contributing to the project.
+Thank you for your interest in contributing to @probelabs/afk! This document provides guidelines and instructions for contributing to the project.
 
 ## Code of Conduct
 
@@ -36,8 +36,8 @@ By participating in this project, you agree to abide by our code of conduct: be 
 
 ```bash
 # Clone your fork
-git clone https://github.com/YOUR_USERNAME/afk-claude.git
-cd afk-claude
+git clone https://github.com/YOUR_USERNAME/afk.git
+cd afk
 
 # Install and test
 npm test
@@ -70,7 +70,7 @@ npm run test:integration
 ## Project Structure
 
 ```
-afk-claude/
+afk/
 ├── bin/
 │   ├── afk           # Main CLI executable
 │   └── afk-debug     # Debug version with verbose logging

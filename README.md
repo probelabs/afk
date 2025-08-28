@@ -50,11 +50,23 @@ afk acts as a bridge between Claude Code and Telegram, intercepting tool usage r
 
 ### 1️⃣ Install the CLI
 
-#### Option A: Clone from GitHub
+#### Option A: Install from npm (Recommended)
+```bash
+# Install globally
+npm install -g @probelabs/afk
+
+# Or with yarn
+yarn global add @probelabs/afk
+
+# Verify installation
+afk --version
+```
+
+#### Option B: Clone from GitHub
 ```bash
 # Clone the repository
-git clone https://github.com/buger/afk-claude.git
-cd afk-claude
+git clone https://github.com/probelabs/afk.git
+cd afk
 
 # Make the binary executable
 chmod +x bin/afk
@@ -69,10 +81,10 @@ export PATH="$HOME/.claude-remote/bin:$PATH"  # Add to ~/.bashrc or ~/.zshrc
 ln -s "$(pwd)/bin/afk" /usr/local/bin/afk
 ```
 
-#### Option B: Direct Download
+#### Option C: Direct Download
 ```bash
 # Download directly from GitHub
-curl -L https://raw.githubusercontent.com/buger/afk-claude/main/bin/afk -o ~/.claude-remote/bin/afk
+curl -L https://raw.githubusercontent.com/probelabs/afk/main/bin/afk -o ~/.claude-remote/bin/afk
 chmod +x ~/.claude-remote/bin/afk
 export PATH="$HOME/.claude-remote/bin:$PATH"
 ```
@@ -337,7 +349,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## 🐛 Issues & Support
 
-Found a bug or have a feature request? Please open an issue on [GitHub Issues](https://github.com/buger/afk-claude/issues).
+Found a bug or have a feature request? Please open an issue on [GitHub Issues](https://github.com/probelabs/afk/issues).
 
 ---
 

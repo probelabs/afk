@@ -1,6 +1,6 @@
 {
-  "name": "afk-claude",
-  "version": "1.0.0",
+  "name": "@probelabs/afk",
+  "version": "0.1.0",
   "description": "Remote control and approval system for Claude Code via Telegram",
   "bin": {
     "afk": "bin/afk"
@@ -9,19 +9,22 @@
     "test": "./test/run-tests.sh",
     "test:permissions": "node test/test-permissions.js",
     "test:integration": "node test/test-integration.js",
-    "test:syntax": "node -c bin/afk"
+    "test:syntax": "node -c bin/afk",
+    "prepublishOnly": "npm test",
+    "version": "git add -A .",
+    "postversion": "git push && git push --tags"
   },
   "type": "commonjs",
   "author": "Leonid Bugaev",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/buger/afk-claude.git"
+    "url": "git+https://github.com/probelabs/afk.git"
   },
   "bugs": {
-    "url": "https://github.com/buger/afk-claude/issues"
+    "url": "https://github.com/probelabs/afk/issues"
   },
-  "homepage": "https://github.com/buger/afk-claude#readme",
+  "homepage": "https://github.com/probelabs/afk#readme",
   "keywords": [
     "claude",
     "claude-code",
@@ -32,6 +35,16 @@
     "afk",
     "cli"
   ],
+  "files": [
+    "bin/**/*",
+    "test/**/*",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "engines": {
     "node": ">=18"
   }
