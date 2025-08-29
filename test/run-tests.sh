@@ -38,6 +38,18 @@ fi
 
 echo ""
 
+# Run runtime error detection tests
+echo "Running runtime error detection tests..."
+node test/test-runtime.js
+if [ $? -ne 0 ]; then
+  echo -e "${RED}❌ Runtime tests failed${NC}"
+  ALL_PASSED=false
+else
+  echo -e "${GREEN}✅ Runtime tests passed${NC}"
+fi
+
+echo ""
+
 # Test actual afk binary syntax
 echo "Testing afk binary syntax..."
 node -c bin/afk

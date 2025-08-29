@@ -7,7 +7,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/Users/leonidbugaev/.claude-remote/bin/afk hook pretooluse"
+            "command": "/Users/leonidbugaev/.afk/bin/afk hook pretooluse"
           }
         ]
       }

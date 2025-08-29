@@ -12,7 +12,7 @@ const { spawnSync } = require('child_process');
 // Constants & paths
 // ---------------------------
 const HOME = os.homedir();
-const USER_CFG_DIR = path.join(HOME, '.afk');
+const USER_CFG_DIR = path.join(HOME, '.claude-remote');
 const USER_BIN = path.join(USER_CFG_DIR, 'bin');
 const USER_CFG = path.join(USER_CFG_DIR, 'config.json');
 const APPROVAL_DIR = path.join(USER_CFG_DIR, 'approvals');
@@ -2590,6 +2590,279 @@ async function hookSessionStart() {
   }
 }
 
+// ---------------------------
+// Telegram bot (long polling)
+// ---------------------------
+async function telegramBot() {
+  const c = cfg();
+  const token = c.telegram_bot_token;
+  const chatId = String(c.telegram_chat_id || '');
+  if (!token || !chatId) {
+    eprint('Bot requires telegram_bot_token and telegram_chat_id in ~/.claude-remote/config.json');
+    process.exit(1);
+  }
+  let offset = 0;
+  const pending = new Map(); // chatId -> sessionId awaiting text
+
+  function api(method, params) { return tgApiWithToken(token, method, params).catch(err => { eprint('[tgApi]', err.message); }); }
+
+  async function loop() {
+    while (true) {
+      try {
+        const updates = await tgApiWithToken(token, 'getUpdates', { timeout: 50, offset, allowed_updates: JSON.stringify(['message','callback_query']) }, { timeoutMs: 60000 });
+        for (const u of updates) {
+          offset = u.update_id + 1;
+          if (u.callback_query) await handleCallback(u.callback_query);
+          if (u.message) await handleMessage(u.message);
+        }
+      } catch (e) {
+        eprint('[bot] polling error:', e.message);
+        await new Promise(r => setTimeout(r, 2000));
+      }
+    }
+  }
+
+  async function handleCallback(q) {
+    const chat = String(q.message && q.message.chat && q.message.chat.id);
+    const data = String(q.data || '');
+    
+    // Debug logging for callbacks
+    eprint(`[callback] Received: ${data} from chat ${chat}`);
+    
+    await api('answerCallbackQuery', { callback_query_id: q.id });
+    if (chat !== chatId) return; // ignore other chats
+    
+    // Handle basic approve/deny
+    if (data.startsWith('approve:') || data.startsWith('deny:')) {
+      const [action, id] = data.split(':');
+      ensureDir(APPROVAL_DIR);
+      fs.writeFileSync(path.join(APPROVAL_DIR, id), action);
+      
+      // Try to get metadata for better approval message
+      let approvalText = action === 'approve' ? '✅ Approved' : '❌ Denied';
+      try {
+        const metaFile = path.join(APPROVAL_DIR, `${id}.meta`);
+        if (fs.existsSync(metaFile)) {
+          const meta = JSON.parse(fs.readFileSync(metaFile, 'utf8'));
+          const toolName = meta.toolName || 'Unknown';
+          const toolCmd = meta.toolInput?.command || '';
+          const shortCmd = toolCmd.length > 50 ? toolCmd.substring(0, 50) + '...' : toolCmd;
+          approvalText = action === 'approve' 
+            ? `✅ *Approved* — ${toolName}\n${shortCmd ? `\`${shortCmd}\`` : ''}` 
+            : `❌ *Denied* — ${toolName}\n${shortCmd ? `\`${shortCmd}\`` : ''}`;
+        }
+      } catch (e) {
+        // Fallback to basic message if metadata read fails
+      }
+      
+      await api('editMessageText', {
+        chat_id: chatId,
+        message_id: q.message.message_id,
+        text: approvalText,
+        parse_mode: 'Markdown'
+      });
+      const map = lookupSessionByMessageId(q.message.message_id);
+      if (map && map.session_id) appendHistory({ type: 'approval', session_id: map.session_id, decision: action, message_id: q.message.message_id });
+      return;
+    }
+    
+    // Handle Allow All
+    if (data.startsWith('allow_all:')) {
+      const [, id] = data.split(':');
+      ensureDir(APPROVAL_DIR);
+      
+      // Read patterns from metadata file (stored separately due to Telegram's 64-byte limit)
+      const metaFile = path.join(APPROVAL_DIR, `${id}.meta`);
+      let patterns = ['unknown'];
+      let meta = {};
+      try {
+        if (fs.existsSync(metaFile)) {
+          meta = JSON.parse(fs.readFileSync(metaFile, 'utf8'));
+          patterns = meta.patterns || meta.pattern || 'unknown';
+          if (!Array.isArray(patterns)) patterns = [patterns];
+          fs.unlinkSync(metaFile); // Clean up metadata file
+        }
+      } catch (e) {
+        eprint('[allow_all] Failed to read metadata:', e.message);
+      }
+      
+      // Add all patterns to settings
+      let addedCount = 0;
+      let skippedCount = 0;
+      for (const pattern of patterns) {
+        const added = addPermissionToSettings(pattern, meta.cwd || process.cwd());
+        if (added) addedCount++;
+        else skippedCount++;
+      }
+      
+      const patternText = patterns.length > 3 ? 
+        `${patterns.slice(0, 3).join('`, `')}... (+${patterns.length - 3} more)` :
+        patterns.join('`, `');
+      
+      // Include tool info in Allow All message
+      let toolInfo = '';
+      try {
+        const metaFile = path.join(APPROVAL_DIR, `${id}.meta`);
+        if (fs.existsSync(metaFile)) {
+          const meta = JSON.parse(fs.readFileSync(metaFile, 'utf8'));
+          const toolName = meta.toolName || 'Unknown';
+          const toolCmd = meta.toolInput?.command || '';
+          const shortCmd = toolCmd.length > 50 ? toolCmd.substring(0, 50) + '...' : toolCmd;
+          toolInfo = ` — ${toolName}\n${shortCmd ? `\`${shortCmd}\`` : ''}\n\n`;
+        }
+      } catch (e) {
+        // Continue without tool info if metadata read fails
+      }
+      
+      const resultText = addedCount > 0 ?
+        `✅ *Allowed All*${toolInfo}Added ${addedCount} new ${addedCount === 1 ? 'pattern' : 'patterns'} to permissions${skippedCount > 0 ? ` (${skippedCount} already existed)` : ''}:\n\`${patternText}\`` :
+        `✅ *Allowed All*${toolInfo}${patterns.length === 1 ? 'Pattern' : 'Patterns'} already existed:\n\`${patternText}\``;
+      
+      fs.writeFileSync(path.join(APPROVAL_DIR, id), `allow_all|${patterns.join(',')}`);
+      
+      try {
+        await api('editMessageText', {
+          chat_id: chatId,
+          message_id: q.message.message_id,
+          text: resultText,
+          parse_mode: 'Markdown'
+        });
+      } catch (e) {
+        eprint('[allow_all] Failed to update message:', e.message);
+        // Fallback: try to send a new message
+        try {
+          await api('sendMessage', {
+            chat_id: chatId,
+            text: `${resultText}\n\n_Original message update failed_`,
+            parse_mode: 'Markdown'
+          });
+        } catch (e2) {
+          eprint('[allow_all] Failed to send fallback message:', e2.message);
+        }
+      }
+      const map = lookupSessionByMessageId(q.message.message_id);
+      if (map && map.session_id) appendHistory({ type: 'approval', session_id: map.session_id, decision: 'allow_all', patterns, message_id: q.message.message_id });
+      return;
+    }
+    
+    // Handle Ask UI
+    if (data.startsWith('ask_ui:')) {
+      const [, id] = data.split(':');
+      ensureDir(APPROVAL_DIR);
+      fs.writeFileSync(path.join(APPROVAL_DIR, id), 'ask_ui');
+      
+      // Try to get metadata for better delegation message
+      let delegateText = '🔧 Delegating to Claude UI';
+      try {
+        const metaFile = path.join(APPROVAL_DIR, `${id}.meta`);
+        if (fs.existsSync(metaFile)) {
+          const meta = JSON.parse(fs.readFileSync(metaFile, 'utf8'));
+          const toolName = meta.toolName || 'Unknown';
+          const toolCmd = meta.toolInput?.command || '';
+          const shortCmd = toolCmd.length > 50 ? toolCmd.substring(0, 50) + '...' : toolCmd;
+          delegateText = `🔧 *Delegating to Claude UI* — ${toolName}\n${shortCmd ? `\`${shortCmd}\`` : ''}`;
+        }
+      } catch (e) {
+        // Fallback to basic message if metadata read fails
+      }
+      
+      await api('editMessageText', {
+        chat_id: chatId,
+        message_id: q.message.message_id,
+        text: delegateText,
+        parse_mode: 'Markdown'
+      });
+      const map = lookupSessionByMessageId(q.message.message_id);
+      if (map && map.session_id) appendHistory({ type: 'approval', session_id: map.session_id, decision: 'ask_ui', message_id: q.message.message_id });
+      return;
+    }
+    if (data.startsWith('reply:')) {
+      const [, session] = data.split(':');
+      pending.set(chatId, session);
+      setLatestSessionForChat(chatId, session);
+      await api('editMessageText', { 
+        chat_id: chatId, 
+        message_id: q.message.message_id, 
+        text: `💬 *Waiting for your follow-up*\n_Session:_ \`${shortSession(session)}\`\n\n**Send your message now** to continue the conversation with Claude.\n\n_The session will wait for your input - no timeout._`, 
+        parse_mode: 'Markdown' 
+      });
+      return;
+    }
+    if (data.startsWith('cont:')) {
+      const [, session] = data.split(':');
+      const [ok, out] = runClaudeResume(session, 'Please continue.');
+      await api('editMessageText', { chat_id: chatId, message_id: q.message.message_id, text: ok ? `▶️ Continued.\n\n${out}` : `⚠️ ${out}` });
+      const map = lookupSessionByMessageId(q.message.message_id);
+      const sid = map && map.session_id ? map.session_id : session;
+      appendHistory({ type: 'continue', session_id: sid, message_id: q.message.message_id });
+      setLatestSessionForChat(chatId, sid);
+      return;
+    }
+    
+    // Handle Finish button - user wants to close the session
+    if (data.startsWith('finish:')) {
+      const [, session] = data.split(':');
+      
+      try {
+        await api('editMessageText', { 
+          chat_id: chatId, 
+          message_id: q.message.message_id, 
+          text: `✅ *Session finished*\n_Session:_ \`${shortSession(session)}\`\n\nThe agent task is complete. You can start a new conversation anytime!`,
+          parse_mode: 'Markdown'
+        });
+      } catch (e) {
+        eprint('[finish] Failed to update message:', e.message);
+        // Fallback: send a new message
+        try {
+          await api('sendMessage', {
+            chat_id: chatId,
+            text: `✅ *Session finished*\n_Session:_ \`${shortSession(session)}\`\n\nThe agent task is complete. You can start a new conversation anytime!\n\n_Original message update failed_`,
+            parse_mode: 'Markdown'
+          });
+        } catch (e2) {
+          eprint('[finish] Failed to send fallback message:', e2.message);
+        }
+      }
+      
+      const map = lookupSessionByMessageId(q.message.message_id);
+      const sid = map && map.session_id ? map.session_id : session;
+      appendHistory({ type: 'finish', session_id: sid, message_id: q.message.message_id });
+      return;
+    }
+  }
+
+  async function handleMessage(m) {
+    const chat = String(m.chat && m.chat.id);
+    if (chat !== chatId) return;
+    const text = m.text || '';
+    if (!text || text.startsWith('/')) return;
+
+    let session = null;
+    if (m.reply_to_message && m.reply_to_message.message_id) {
+      const map = lookupSessionByMessageId(m.reply_to_message.message_id);
+      if (map && map.session_id) session = map.session_id;
+    }
+    if (!session && pending.has(chatId)) {
+      session = pending.get(chatId);
+      pending.delete(chatId);
+    }
+    if (!session) {
+      session = getLatestSessionForChat(chatId);
+    }
+
+    if (session) {
+      appendHistory({ type: 'reply', session_id: session, message_id: m.message_id, text });
+      setLatestSessionForChat(chatId, session);
+      const [ok, out] = runClaudeResume(session, text);
+      await api('sendMessage', { chat_id: chatId, text: ok ? out : `⚠️ ${out}` });
+    } else {
+      await api('sendMessage', { chat_id: chatId, text: '⚠️ No recent session found. Tap Reply on a session message or run a tool to create one.' });
+    }
+  }
+
+  console.log('afk bot: polling…');
+  loop();
+}
 
 // ---------------------------
 // Installer / Uninstaller
@@ -2619,7 +2892,7 @@ function install(scope, projectRoot) {
 
 function uninstall(scope) {
   if (scope === 'user') {
-    console.log('To uninstall, remove hook entries from ~/.claude/settings.json `hooks` section and delete ~/.afk.');
+    console.log('To uninstall, remove hook entries from ~/.claude/settings.json `hooks` section and delete ~/.claude-remote.');
   } else {
     console.log('To uninstall, remove hook entries from your project\'s .claude/settings(.local).json and delete ./.claude/hooks/afk');
   }
@@ -2697,7 +2970,7 @@ function printHelp() {
 `  mode [on|off|toggle|local|remote|status]\n` +
 `      Switch between LOCAL (no remote approvals) and REMOTE (Telegram approvals).\n` +
 `  debug [on|off|status]\n` +
-`      Enable/disable persistent debug logging to ~/.afk/debug.log\n` +
+`      Enable/disable persistent debug logging to ~/.claude-remote/debug.log\n` +
 `  telegram test\n` +
 `      Send a test message to verify Telegram connection.\n` +
 `  inbox wait --session <id> [--timeout 21600]\n` +
@@ -2760,14 +3033,14 @@ async function main() {
     if (subcmd === 'on') {
       fs.writeFileSync(debugFile, '1');
       console.log('✅ Debug mode enabled persistently');
-      console.log('Debug log: ~/.afk/debug.log');
+      console.log('Debug log: ~/.claude-remote/debug.log');
     } else if (subcmd === 'off') {
       if (fs.existsSync(debugFile)) fs.unlinkSync(debugFile);
       console.log('✅ Debug mode disabled');
     } else {
       const enabled = fs.existsSync(debugFile);
       console.log(`Debug mode: ${enabled ? 'ENABLED' : 'DISABLED'}`);
-      if (enabled) console.log('Debug log: ~/.afk/debug.log');
+      if (enabled) console.log('Debug log: ~/.claude-remote/debug.log');
     }
   } else if (cmd === 'mode') {
     modeCmd(argv[1] || 'status');
@@ -2818,7 +3091,7 @@ main().catch(e => { eprint('Fatal:', e.stack || e.message); process.exit(1); });
 // ---------------------------
 async function setupInteractive() {
   console.log('afk interactive setup');
-  console.log('This will configure Telegram and write ~/.afk/config.json');
+  console.log('This will configure Telegram and write ~/.claude-remote/config.json');
 
   const token = await promptLine('Enter Telegram bot token (from @BotFather): ', { mask: true });
   if (!token) { console.log('Aborted: no token.'); return; }

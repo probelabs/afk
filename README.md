@@ -1,357 +1,325 @@
-# afk - Claude Code Remote Control via Telegram
+<p align="center">
+  <img src="site/afk-logo.png" alt="AFK Logo" width="200" />
+</p>
+
+# AFK - Control Claude Code from Anywhere
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Node Version](https://img.shields.io/badge/node-%E2%89%A518-brightgreen.svg)](https://nodejs.org/)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-0-blue.svg)](package.json)
+[![npm version](https://img.shields.io/npm/v/@probelabs/afk.svg)](https://www.npmjs.com/package/@probelabs/afk)
 
-**afk** (Away From Keyboard) is a powerful CLI tool that enables remote control and approval workflows for Claude Code through Telegram. Perfect for when you want to monitor and control Claude's actions while away from your desk.
+> **Your code doesn't stop when you leave your desk.** Get Telegram notifications for Claude Code actions and approve them from anywhere. No cloud dependencies, no third-party servers.
 
-## 🎯 Key Features
+## ⚡ Quick Start
 
-- **🔐 Remote Approval System**: Approve or deny Claude's tool usage remotely via Telegram
-- **🔄 AFK Toggle**: Simple CLI commands to switch between local and remote modes
-- **📱 Telegram Integration**: Real-time notifications and interactive approval buttons
-- **🎭 Multi-Session Support**: Handle multiple Claude sessions simultaneously
-- **📦 Zero Dependencies**: Built entirely with Node.js ≥18 built-ins
-- **🔌 Flexible Installation**: User, project, or local scope installation options
-- **📬 Local Inbox**: Optional blocking Stop flows for enhanced control
+3 commands, 2 minutes, full mobile control:
 
-## 📋 Table of Contents
-
-- [Requirements](#requirements)
-- [Quick Start](#quick-start)
-- [Installation](#installation)
-- [Configuration](#configuration)
-- [Usage](#usage)
-- [Commands](#commands)
-- [Architecture](#architecture)
-- [Testing](#testing)
-- [Contributing](#contributing)
-- [License](#license)
-
-## 🚀 How It Works
-
-afk acts as a bridge between Claude Code and Telegram, intercepting tool usage requests and forwarding them to your Telegram bot for approval when in "remote" mode.
-
-- Manual AFK: `/afk on|off|toggle|status` via a deterministic UserPromptSubmit hook (blocks the prompt; updates state).
-- PreToolUse: Gates permissioned tools with Telegram Approve/Deny when AFK=remote, before Claude’s normal permission UI.
-- Notification: Forwards Claude notifications to Telegram.
-- Stop: Sends a labeled “Agent finished” message with [Reply]/[Continue]; native Telegram Reply is supported.
-- Multi‑session: Each Telegram message is mapped to a session; plain messages target the latest session by default.
-- Local inbox: `inbox wait` enables optional blocking Stop flows.
-
-## 📦 Requirements
-
-- Node.js ≥ 18
-- A Telegram bot token (from @BotFather) and your Telegram user chat ID
-- Claude Code (to install/approve hooks under `/hooks`)
-
-## 🏁 Quick Start
-
-### 1️⃣ Install the CLI
-
-#### Option A: Install from npm (Recommended)
 ```bash
-# Install globally
+# 1. Install and setup
 npm install -g @probelabs/afk
+afk setup  # Creates your Telegram bot
 
-# Or with yarn
-yarn global add @probelabs/afk
-
-# Verify installation
-afk --version
+# 2. Go remote
+afk        # Smart toggle: installs hooks and enables remote mode
 ```
 
-#### Option B: Clone from GitHub
+**That's it!** Claude Code now sends approval requests to your phone. 📱
+
+### What happens next?
+- Claude starts a task → You get a Telegram notification
+- Tap **Approve** → Claude continues
+- Tap **Deny** → Claude stops and asks for guidance
+- Step away confident your code is safe
+
+## 🎯 Why AFK?
+
+**📱 Mobile Development Freedom**
+- ☕ Step away during long refactors
+- 🚇 Approve changes from your commute  
+- 🏖️ Monitor critical tasks remotely
+- 🔒 Add approval gates for sensitive operations
+
+**🔐 Privacy First**
+- Zero cloud dependencies
+- Direct Telegram connection
+- Your bot, your control
+- Local state only
+
+**🚀 Smart Integration**
+- Works with Claude Code's permission system
+- Multi-project session management
+- Auto-approve safe operations
+- Timeout protection
+
+## 🛠️ Commands
+
+### Basic Usage
 ```bash
-# Clone the repository
-git clone https://github.com/probelabs/afk.git
-cd afk
-
-# Make the binary executable
-chmod +x bin/afk
-
-# Add to PATH (choose one):
-# Option 1: Copy to local bin
-mkdir -p ~/.claude-remote/bin
-cp bin/afk ~/.claude-remote/bin/afk
-export PATH="$HOME/.claude-remote/bin:$PATH"  # Add to ~/.bashrc or ~/.zshrc
-
-# Option 2: Create symlink
-ln -s "$(pwd)/bin/afk" /usr/local/bin/afk
+afk              # Smart toggle: install if needed, then toggle mode
+afk on           # Enable remote approvals  
+afk off          # Disable remote approvals
+afk status       # Check current mode
 ```
 
-#### Option C: Direct Download
+### Setup & Installation
 ```bash
-# Download directly from GitHub
-curl -L https://raw.githubusercontent.com/probelabs/afk/main/bin/afk -o ~/.claude-remote/bin/afk
-chmod +x ~/.claude-remote/bin/afk
-export PATH="$HOME/.claude-remote/bin:$PATH"
+afk setup        # Interactive Telegram bot setup
+afk install      # Install Claude Code hooks
+afk uninstall    # Remove hooks
 ```
 
-### 2️⃣ Run Guided Setup
-
-The interactive setup wizard will help you configure everything:
-
-```
-afk setup
+### Testing & Debug
+```bash
+afk telegram test    # Test Telegram connection
+afk debug on         # Enable debug logging
 ```
 
-The wizard asks for your Telegram bot token (masked), verifies it, guides you to message the bot, auto‑detects your chat ID, writes `~/.claude-remote/config.json`, and sends a test message.
+## 🔧 How it Works
 
-### 3️⃣ Install Claude Code Hooks
+**1. Hook Integration**
+AFK hooks into Claude Code at key decision points:
+- **PreToolUse**: Intercepts risky operations (file edits, bash commands, web requests)
+- **SessionStart**: Notifies when new coding sessions begin  
+- **Stop**: Enables follow-up conversations when tasks complete
 
-Choose your installation scope:
+**2. Smart Permissions**
+- Respects Claude's existing allow/deny lists
+- Auto-approves safe tools like `Read` and `Grep`
+- Creates permanent patterns from one-time approvals
 
+**3. Mobile Approval Flow**
 ```
-afk install
-# or explicitly
-afk install --scope user
-afk install --scope project --project-root /path/to/repo
-afk install --scope local   --project-root /path/to/repo
-```
-
-### 4️⃣ Approve Hooks in Claude Code
-
-Open Claude Code → run `/hooks` → approve the newly installed hooks.
-
-### 5️⃣ Start the Telegram Bot
-
-Launch the bot (runs as a single instance):
-
-```
-afk telegram start-bot
-```
-
-6) Toggle AFK and use:
-
-```
-afk mode on   # REMOTE: approvals required
-afk mode off  # LOCAL: normal prompts
+Claude wants to edit file.js
+        ↓
+AFK checks: Local or Remote mode?
+        ↓
+Sends Telegram notification with context
+        ↓
+You tap: [Approve] [Deny] [Allow All] [Ask Claude UI]
+        ↓
+Claude proceeds or stops based on your choice
 ```
 
-## Commands
+**4. Session Management**
+- Each Claude session gets unique ID
+- Messages tagged with project and session
+- Reply threading maintains conversation context
 
-- install: `afk install [--scope user|project|local] [--project-root PATH]`
-  - Writes hooks at the chosen scope. Prompts when flags are omitted.
-  - User scope: `~/.claude/settings.json` and `~/.claude-remote/bin/afk`.
-  - Project scope: `./.claude/settings.json` and `./.claude/hooks/afk` (checked in).
-  - Local scope: `./.claude/settings.local.json` and `./.claude/hooks/afk` (not checked in).
+## 🏗️ Architecture
 
-- setup: `afk setup`
-  - Interactive Telegram link: token → verify → detect chat → save → test.
+### System Overview
 
-- uninstall: `afk uninstall --scope user|project|local [--project-root PATH]`
-  - Prints non‑destructive steps to remove hooks and the executable.
+```
+┌──────────────────┐         ┌──────────────────┐         ┌──────────────────┐
+│                  │         │                  │         │                  │
+│   Claude Code    │────────▶│   AFK Hooks      │────────▶│   Telegram API   │
+│                  │         │                  │         │                  │
+│  • PreToolUse    │         │ • Intercepts     │         │ • Distributed    │
+│  • SessionStart  │         │ • Routes msgs    │         │   polling        │
+│  • Stop events   │◀────────│ • Manages state  │◀────────│ • Button handling│
+│  • Notifications │         │                  │         │                  │
+└──────────────────┘         └──────────────────┘         └──────────────────┘
+        ▲                            │                            
+        │                            │                            
+        │                            ▼                            
+        │                    ┌──────────────────┐                
+        │                    │                  │                
+        └────────────────────│   Local State    │                
+                             │                  │                
+                             │ • ~/.afk         │               
+                             │ • Mode (on/off)  │               
+                             │ • Session map    │               
+                             │ • Approvals      │               
+                             └──────────────────┘               
+```
 
-- mode: `afk mode [on|off|toggle|local|remote|status]`
-  - on / remote: Switch to REMOTE — all permissioned tools require Telegram approval.
-  - off / local: Switch to LOCAL — tools run with Claude’s normal permission prompts.
-  - toggle: Flip between LOCAL and REMOTE.
-  - status: Print the current mode with short guidance.
-  - State is global and stored at `~/.claude-remote/mode` (`local` or `remote`).
+### Hook Integration Points
 
-- telegram: `afk telegram start-bot|test`
-  - start-bot: Starts the long‑polling bot to handle Approve/Deny and Reply/Continue. Run exactly one instance.
-  - test: Sends a test message to your configured chat.
+**PreToolUse Hook** - Gates tool execution:
+- Checks current mode (local/remote)
+- Validates against Claude's existing permissions
+- Sends approval requests to Telegram in remote mode
+- Waits for user response with timeout
 
-- inbox: `afk inbox wait --session <id> [--timeout 21600]`
-  - Local poller for a `reply` or `continue` event for a specific session. Useful when enabling blocking Stop behavior.
+**SessionStart Hook** - New session notifications:
+- Notifies when Claude begins new coding sessions
+- Waits for initial instructions or "Continue" 
+- Can inject follow-up tasks via process exit code 2
 
-- hook: `afk hook pretooluse|stop|userpromptsubmit`
-  - Internal entrypoints used by hooks (read JSON on stdin; write JSON on stdout where applicable).
+**Stop Hook** - Task completion handling:
+- Sends completion notifications to Telegram
+- Enables follow-up conversations and instructions
+- Supports session continuation or closure
 
-## Hooks & Behavior
+## ⚙️ Configuration
 
-- UserPromptSubmit
-  - Intercepts `/afk on|off|toggle|status` deterministically, updates state, and blocks the prompt with a friendly message.
+Run `afk setup` for interactive configuration. The wizard:
 
-- PreToolUse (smart permission gatekeeper)
-  - **Fully respects Claude's permission chain**: Checks local → project → user settings
-  - **Only prompts when Claude would ask**: If already in allow/deny lists, defers to Claude
-  - When AFK=remote and Claude would show permission dialog, sends Telegram card with four options:
-    - **✅ Approve**: Allow this specific tool call once
-    - **❌ Deny**: Block this specific tool call  
-    - **✅ Allow All**: Allow and add a permission pattern to `~/.claude/settings.json` for future auto-approval
-    - **🔧 Ask Claude UI**: Show Claude's native permission dialog with its own Allow/Allow All/Deny options
-  - Auto‑approve list (default `["Read"]`) bypasses the prompt even in remote.
-  - Timeout (default 3600s/1 hour) with configurable action via `timeout_action`:
-    - `"deny"` (default): Auto-deny after timeout
-    - `"allow"`: Auto-approve after timeout
-    - `"wait"`: Keep waiting indefinitely for user response
-  - Telegram message updates to show timeout status
-  - Multiple requests are independent and safe to approve/deny in any order.
-  - Permission patterns are intelligently generated based on tool type:
-    - Bash commands: `Bash(npm run:*)`, `Bash(git status:*)`, etc.
-    - WebFetch URLs: `WebFetch(domain:example.com)`  
-    - MCP tools and internal tools: Use full tool name
+1. 🤖 Creates your Telegram bot via @BotFather
+2. 🔑 Securely stores bot token (masked input)
+3. 💬 Auto-detects your chat ID  
+4. ✅ Tests the connection
+5. 💾 Saves to `~/.afk/config.json`
 
-
-- Stop (session follow‑ups)
-  - Sends “Agent finished — <folder>” with [Reply]/[Continue].
-  - Native Telegram Reply to this message routes your text to that exact session.
-  - Plain messages (not a reply) route to the latest session in your chat.
-  - Always blocks and waits for user interaction. Timeout: `CC_REMOTE_STOP_TIMEOUT` (seconds, default 21600/6 hours).
-
-## Multi‑Session Routing
-
-- Telegram messages include a project label (derived from `cwd`, e.g., `repo/subdir`) and a short session id.
-- Each outgoing message is recorded in `~/.claude-remote/session-map.json` (message_id → session metadata) and appended to `~/.claude-remote/history.jsonl`.
-- Native Reply uses `reply_to_message.message_id` to target the correct session.
-- Plain messages route to the latest session for your chat, tracked in the session map.
-- Approvals are always 1:1: each PreToolUse request has its own Approve/Deny card and independent timeout.
-
-## Files & State
-
-- `~/.claude-remote/config.json`
-  - `telegram_bot_token`: string — Bot token from @BotFather.
-  - `telegram_chat_id`: string — Your user chat ID.
-  - `timeout_seconds`: number — PreToolUse approval timeout in seconds (default: 3600/1 hour, 0 or -1 for infinite).
-  - `timeout_action`: string — What to do on timeout: `"deny"` (default), `"allow"`, or `"wait"`.
-  - `intercept_matcher`: string (regex) — Which tools to gate.
-  - `auto_approve_tools`: string[] — Tools allowed even in remote.
-  - `respect_claude_permissions`: boolean — Check Claude's settings.json before prompting (default: true).
-  - Env fallbacks: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` can populate values.
-
-- `~/.claude-remote/mode` — `local` or `remote` (global AFK mode).
-- `~/.claude-remote/approvals/` — transient files for Approve/Deny decisions.
-- `~/.claude-remote/session-map.json` — message_id → session mapping + latest session per chat.
-- `~/.claude-remote/history.jsonl` — append‑only event log (trimmed to last ~200 lines).
-
-- Project scope files (if installed there):
-  - `./.claude/settings.json` or `./.claude/settings.local.json` — hooks section.
-  - `./.claude/hooks/afk` — executable copy used by hooks.
-  - `./.claude/commands/afk.md` — discoverability; actual toggle via UserPromptSubmit.
-
-## Multiple Projects & Sessions
-
-- Mode and Telegram config are global. Hooks at any scope read the same config/state.
-- Install at user scope to cover all projects, or at project/local scope to check in/out configuration.
-- Run exactly one bot instance with your token; multiple pollers will race on `getUpdates`.
-
-## Security & Safety
-
-- Hooks run with your user privileges. Review commands and test before production use.
-- Claude Code snapshots hook config; after edits, open `/hooks` to approve changes.
-- Keep `intercept_matcher` narrow to your threat model; only gate the tools you need.
-
-## Troubleshooting
-
-- No Telegram messages:
-  - Re‑run `afk setup`; verify token/chat id; ensure outbound HTTPS is allowed.
-  - Confirm the bot is running: `afk telegram start-bot` (single instance).
-
-- Buttons do nothing:
-  - Ensure only one bot instance is running (multiple pollers may drop updates).
-
-- Approvals not gating:
-  - Set AFK to remote: `afk mode on`.
-  - Check matcher covers your tool names; re‑approve hooks via `/hooks`.
-
-- Reply routed to wrong session:
-  - Use native Reply to the session message; otherwise routing defaults to the latest session.
-
-- “(no output)” after Reply/Continue:
-  - The `claude` CLI printed no stdout. Routing still worked; this is expected in mock/local tests.
-
-## Configuration Examples
-
-### Timeout Configuration
-
-Example `~/.claude-remote/config.json`:
-
+**Config file:**
 ```json
 {
   "telegram_bot_token": "YOUR_BOT_TOKEN",
   "telegram_chat_id": "YOUR_CHAT_ID",
-  "timeout_seconds": 3600,        // 1 hour timeout (default)
-  "timeout_action": "wait",       // Options: "deny", "allow", "wait"
+  "timeout_seconds": 3600,
   "intercept_matcher": "Bash|Edit|Write|MultiEdit|WebFetch|mcp__.*",
-  "auto_approve_tools": ["Read"],
-  "respect_claude_permissions": true
+  "auto_approve_tools": ["Read"]
+}
+```
+
+### Configuration Options
+
+| Option | Description | Default | Options |
+|--------|-------------|---------|---------|
+| `timeout_seconds` | Approval timeout | `3600` (1 hour) | Any positive number, `0` for infinite |
+| `intercept_matcher` | Tools to intercept | `"Bash\|Edit\|Write\|MultiEdit\|WebFetch\|mcp__.*"` | Regex pattern |
+| `auto_approve_tools` | Always allow these | `["Read"]` | Array of tool names |
+
+**Note**: Additional options like `timeout_action` and `respect_claude_permissions` can be added manually to the config file if needed.
+
+### Environment Variables
+
+```bash
+export TELEGRAM_BOT_TOKEN="your_token"    # Alternative to config file
+export TELEGRAM_CHAT_ID="your_chat_id"    # Alternative to config file
+export CC_REMOTE_STOP_TIMEOUT=21600       # Stop event timeout (6 hours)
+```
+
+## 🔐 Smart Approval System
+
+**Permission Flow:**
+1. Check Claude's existing permissions → Use those if set
+2. Check auto-approve list → Safe tools go through automatically  
+3. Check mode → Local uses Claude UI, Remote sends to Telegram
+4. Telegram approval → Tap **[Approve]**, **[Deny]**, **[Allow All]**, or **[Ask Claude UI]**
+
+**Smart Patterns:**
+When you tap **[Allow All]**, AFK creates permanent rules like:
+- `Bash(npm test:*)` - Allow all npm test commands
+- `Edit(/src/*)` - Allow edits to source files
+- `WebFetch(domain:api.github.com)` - Allow GitHub API calls
+
+### Permission Pattern Examples
+
+Patterns are automatically generated based on context:
+
+```javascript
+// Bash commands → command prefix patterns
+"Bash(npm run:*)"      // All npm run scripts
+"Bash(git:*)"          // All git commands
+"Bash(curl:*)"         // All curl requests
+
+// Web requests → domain patterns
+"WebFetch(domain:api.example.com)"   // Specific API
+"WebFetch(domain:*.example.com)"     // Subdomains
+
+// File operations → path patterns
+"Edit(/src/*)"         // All files in src/
+"Write(/tests/*)"      // All test files
+"MultiEdit(/config/*)" // Multi-file edits in config/
+```
+
+## 📱 Multi-Session Support
+
+### Session Identification
+
+Each Telegram message includes:
+- 📁 **Project**: Derived from working directory
+- 🔖 **Session ID**: Short unique identifier  
+- ⏰ **Timestamp**: When request was made
+
+Example message:
+```
+[my-project] [sess-a1b2] 
+Claude requests: Edit server.js
+
+[Approve] [Deny] [Allow All] [Ask Claude UI]
+```
+
+### Reply Routing
+- **Native Reply**: Always routes to the original session
+- **Plain Message**: Routes to the most recent session
+- **Multiple Projects**: Each maintains independent state
+
+## 🔧 Troubleshooting
+
+**No Telegram messages?**
+```bash
+afk status          # Check if remote mode is enabled
+afk telegram test   # Test connection
+```
+
+**Buttons not working?**
+- Only run one AFK instance at a time
+- Verify your Telegram bot has message permissions
+
+## 🚀 Advanced Features
+
+### Timeout Configuration
+Control what happens when approvals timeout:
+
+```json
+{
+  "timeout_seconds": 3600,     // 1 hour
+  "timeout_action": "deny"     // Auto-deny on timeout
 }
 ```
 
 **Timeout Actions:**
-- `"deny"`: Auto-deny after timeout (safe default)
-- `"allow"`: Auto-approve after timeout (convenient but less secure)
-- `"wait"`: Keep waiting indefinitely (never timeout, best for long AFK periods)
+- `"deny"`: Safe default, blocks operation
+- `"allow"`: Convenient but less secure
+- `"wait"`: Never timeout, wait indefinitely
 
-## Enhanced Permission Management
-
-The "Allow All" feature integrates with Claude Code's native permission system:
-
-1. **One-time approval**: Use "Approve" for single-use permission
-2. **Permanent patterns**: Use "Allow All" to add patterns to `~/.claude/settings.json`
-3. **Delegate to UI**: Use "Ask Claude UI" to see Claude's native permission dialog
-4. **Smart patterns**: Automatically generates appropriate permission patterns:
-   - `Bash(npm test:*)` - All npm test variations
-   - `Bash(git:*)` - All git commands
-   - `WebFetch(domain:api.example.com)` - All URLs from that domain
-   - `mcp__code-search__search_code` - Specific MCP tools
-
-Permission patterns are saved to `~/.claude/settings.json` and persist across sessions, reducing approval fatigue while maintaining security.
-
-## Examples
-
-- Simulate an approval (blocks until Approve/Deny/Allow All/Ask UI):
-```
-echo '{"tool_name":"Bash","tool_input":{"command":"npm test"},"session_id":"sess-1","cwd":"/path/to/proj"}' | afk hook pretooluse
-```
-
-- Simulate a stop notice:
-```
-echo '{"session_id":"sess-1","cwd":"/path/to/proj"}' | afk hook stop
-```
-
-- Wait locally for a reply/continue (used with blocking Stop):
-```
-afk inbox wait --session sess-1 --timeout 120
-```
-
-## 🧪 Testing
-
-Run the test suite to ensure everything is working correctly:
+### Blocking Stop Events
+Enable interactive follow-ups after Claude finishes:
 
 ```bash
-# Run all tests
-npm test
-
-# Run specific test suites
-npm run test:permissions   # Test permission handling
-npm run test:integration   # Test integration flows
-npm run test:syntax        # Verify syntax is valid
+# In your Stop hook configuration, AFK automatically waits for user input
+# Users can then reply with follow-up instructions or tap [Continue]
 ```
 
-## 🤝 Contributing
+### Installation Scopes
+```bash
+# Global (all projects)
+afk install --scope user
 
-Contributions are welcome! Please read our [Contributing Guidelines](CONTRIBUTING.md) for details on:
-- Code of conduct
-- Development setup
-- Pull request process
-- Coding standards
+# Project-specific 
+afk install --scope project
 
-## 📝 License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## 🙏 Acknowledgments
-
-- Built for the Claude Code community
-- Inspired by the need for better remote control of AI assistants
-- Zero dependencies philosophy for maximum portability
-
-## 📚 Resources
-
-- [Claude Code Documentation](https://docs.anthropic.com/claude-code)
-- [Telegram Bot API](https://core.telegram.org/bots/api)
-- [Node.js Built-in Modules](https://nodejs.org/api/)
-
-## 🐛 Issues & Support
-
-Found a bug or have a feature request? Please open an issue on [GitHub Issues](https://github.com/probelabs/afk/issues).
+# Local development
+afk install --scope local
+```
 
 ---
 
-**Made with ❤️ for the Claude Code community**
+## 📦 Installation
 
+**Requirements:** Node.js ≥ 18, Claude Code, Telegram account
+
+### Install Methods
+
+#### 🌟 **Recommended: npm Global**
+```bash
+npm install -g @probelabs/afk
+```
+
+#### 🔧 **From Source**
+```bash
+git clone https://github.com/probelabs/afk.git
+cd afk
+npm link  # Creates global symlink
+```
+
+## 📄 License
+
+MIT License - Part of the [Probe Labs](https://probelabs.com) ecosystem
+
+## 🔗 Links
+
+📖 [Documentation](https://probelabs.com/afk) • 🐛 [Issues](https://github.com/probelabs/afk/issues) • 💬 [Discussions](https://github.com/probelabs/afk/discussions)

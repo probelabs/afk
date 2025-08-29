@@ -30,9 +30,13 @@ test-*.txt
 debug/
 
 # Local config
-~/.claude-remote/
+~/.afk/
 config.json
 mode
 approvals/
 session-map.json
 history.jsonl
+
+# Vow - AI accountability files
+.vow-challenge
+.vow-consent
