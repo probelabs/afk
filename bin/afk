@@ -1076,12 +1076,14 @@ function writeSettings(scope, projectRoot) {
 
   const pretoolCmd = `${hookCmdBase} hook pretooluse`;
   const stopCmd = `${hookCmdBase} hook stop`;
+  const sessionStartCmd = `${hookCmdBase} hook sessionstart`;
 
   let settings = loadJson(settingsPath, {});
   settings = mergeHooks(settings, [{ type: 'command', command: pretoolCmd, timeout: 21600 }], 'PreToolUse', cfg().intercept_matcher);
   // Notification hook removed - redundant with PreToolUse  
   settings = mergeHooks(settings, [{ type: 'command', command: stopCmd, timeout: 21600 }], 'Stop', null);
-  // UserPromptSubmit hook removed - simplifying to just PreToolUse and Stop
+  settings = mergeHooks(settings, [{ type: 'command', command: sessionStartCmd, timeout: 21600 }], 'SessionStart', null);
+  // UserPromptSubmit hook removed - simplifying to just PreToolUse, Stop and SessionStart
 
   saveJson(settingsPath, settings);
   installAfkSlashCommand(scopeDir);
@@ -2288,6 +2290,104 @@ async function hookStop() {
 }
 
 // ---------------------------
+// SessionStart hook handler
+// ---------------------------
+async function hookSessionStart() {
+  const data = await readStdinJson();
+  const sessionId = data.session_id;
+  
+  // Always log that we're triggered
+  eprint(`🚀 [afk] SessionStart hook triggered (session: ${sessionId?.substring(0, 8)}...)`);
+  console.log(`🚀 [afk] SessionStart hook triggered (session: ${sessionId?.substring(0, 8)}...)`);
+  
+  debugLog('HOOK_SESSIONSTART', 'SessionStart hook triggered', {
+    sessionId,
+    cwd: data.cwd,
+    transcript_path: data.transcript_path,
+    source: data.source
+  });
+
+  // In local mode, don't send Telegram notifications
+  const mode = readMode();
+  if (mode !== 'remote') {
+    debugLog('HOOK_SESSIONSTART', 'Local mode - no Telegram notification', {
+      mode,
+      reason: 'local mode active'
+    });
+    eprint(`[afk] Local mode - no SessionStart notification sent`);
+    return;
+  }
+
+  // Track this session as active
+  trackActiveSession(sessionId, data.cwd || process.cwd());
+
+  // Prepare session info for Telegram
+  const cwd = data.cwd || process.cwd();
+  const label = projectLabel(cwd);
+  const source = data.source || 'unknown';
+  
+  // Create a friendly message about the new session
+  let sourceText = '';
+  switch (source) {
+    case 'startup':
+      sourceText = '🆕 **New session started**';
+      break;
+    case 'resume':
+      sourceText = '🔄 **Session resumed**';
+      break;
+    case 'clear':
+      sourceText = '🧹 **Session cleared & restarted**';
+      break;
+    default:
+      sourceText = '🚀 **Session initialized**';
+  }
+  
+  const text = `${sourceText} — ${label}\n_Session:_ \`${shortSession(sessionId)}\`\n_Dir:_ \`${cwd}\`\n\nTap *Reply* to send instructions to this session.`;
+  
+  const keyboard = { inline_keyboard: [[
+    { text: '💬 Reply', callback_data: `reply:${sessionId}` }
+  ]] };
+
+  try {
+    const msgRes = await sendTelegramMessage(text, keyboard);
+    if (msgRes && msgRes.message_id && msgRes.chat) {
+      rememberMessageMapping(msgRes.message_id, {
+        kind: 'session_start',
+        session_id: sessionId,
+        chat_id: String(msgRes.chat.id),
+        cwd,
+        project_label: label,
+        source
+      });
+      appendHistory({ 
+        type: 'session_start', 
+        session_id: sessionId, 
+        message_id: msgRes.message_id, 
+        cwd, 
+        project_label: label,
+        source
+      });
+    }
+    
+    debugLog('HOOK_SESSIONSTART', 'SessionStart notification sent', {
+      sessionId,
+      messageId: msgRes?.message_id,
+      label,
+      source
+    });
+    
+    eprint(`📱 [afk] SessionStart notification sent to Telegram`);
+    
+  } catch (e) {
+    eprint('[telegram] failed to send session start notice:', e.message);
+    debugLog('HOOK_SESSIONSTART', 'Failed to send notification', {
+      sessionId,
+      error: e.message
+    });
+  }
+}
+
+// ---------------------------
 // Telegram bot (long polling)
 // ---------------------------
 async function telegramBot() {
@@ -2672,7 +2772,7 @@ function printHelp() {
 `      Start the long-polling bot or send a test message.\n` +
 `  inbox wait --session <id> [--timeout 21600]\n` +
 `      Wait locally for a \"reply\" or \"continue\" event for that session.\n` +
-`  hook pretooluse|stop|userpromptsubmit\n` +
+`  hook pretooluse|stop|sessionstart\n` +
 `      Internal entrypoints used by Claude Code hooks.\n` +
 `\nExamples:\n` +
 `  afk                    # Smart toggle: install or toggle mode\n` +
@@ -2752,6 +2852,7 @@ async function main() {
     const event = argv[1];
     if (event === 'pretooluse') await hookPreToolUse();
     else if (event === 'stop') await hookStop();
+    else if (event === 'sessionstart') await hookSessionStart();
     else printHelp();
   } else if (cmd === 'setup') {
     await setupInteractive();

@@ -1,6 +1,6 @@
 {
   "name": "@probelabs/afk",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Remote control and approval system for Claude Code via Telegram",
   "bin": {
     "afk": "bin/afk"
@@ -12,7 +12,9 @@
     "test:syntax": "node -c bin/afk",
     "prepublishOnly": "npm test",
     "version": "git add -A .",
-    "postversion": "git push && git push --tags"
+    "postversion": "git push && git push --tags",
+    "deploy:site": "cd site && npx wrangler pages deploy . --project-name=afk-site --commit-dirty=true",
+    "deploy:worker": "npx wrangler deploy"
   },
   "type": "commonjs",
   "author": "Leonid Bugaev",
