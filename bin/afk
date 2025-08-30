@@ -233,8 +233,8 @@ function atomicClaimMessage(filterFn, hookId) {
   }
 }
 
-async function distributedTelegramPoll(filterFn, hookId, timeoutMs = 21600000) {
-  eprint(`[${hookId}] Starting distributed polling...`);
+async function distributedTelegramPoll(filterFn, hookId, sessionId, timeoutMs = 21600000) {
+  eprint(`[${hookId}] Starting distributed polling for session ${sessionId}...`);
   
   const { telegram_bot_token: token } = cfg();
   if (!token) {
@@ -247,6 +247,13 @@ async function distributedTelegramPoll(filterFn, hookId, timeoutMs = 21600000) {
   
   while (Date.now() - startTime < timeoutMs) {
     try {
+      // Check if mode switched to local - if so, exit polling
+      if (readMode() === 'local') {
+        eprint(`[${hookId}] Mode switched to local - exiting polling`);
+        // Allow the hook to exit gracefully (Claude will proceed with local permissions)
+        return null;
+      }
+      
       // Get updates with offset to avoid conflicts with other pollers
       const updates = await tgApiWithToken(token, 'getUpdates', {
         offset: lastUpdateId + 1,
@@ -279,6 +286,11 @@ async function distributedTelegramPoll(filterFn, hookId, timeoutMs = 21600000) {
           removeActiveSession(session.sessionId);
         }
         lastAbandonedCheck = now;
+      }
+      
+      // Update session heartbeat to indicate we're still polling
+      if (sessionId) {
+        updateSessionActivity(sessionId);
       }
       
       // Brief pause to prevent hammering the API
@@ -869,8 +881,10 @@ function checkAbandonedSessions() {
       const lastActivity = new Date(session.lastActivity);
       const timeSinceActivity = (now - lastActivity) / 1000; // seconds
       
-      // Consider session abandoned after 5 minutes of inactivity
-      if (timeSinceActivity > 300) {
+      // Consider session abandoned if no heartbeat for 2 seconds
+      // (heartbeats occur every 1 second during polling)
+      const heartbeatTimeout = 2; // seconds - if no update for 2s, hook has likely exited
+      if (timeSinceActivity > heartbeatTimeout) {
         abandonedSessions.push({
           sessionId,
           ...session,
@@ -1247,16 +1261,8 @@ function lookupSessionByMessageId(messageId) {
   return map.messages[String(messageId)] || null;
 }
 
-function getLatestSessionForChat(chatId) {
-  const map = loadSessionMap();
-  return map.latest_per_chat[String(chatId)] || null;
-}
-
-function setLatestSessionForChat(chatId, sessionId) {
-  const map = loadSessionMap();
-  map.latest_per_chat[String(chatId)] = sessionId;
-  saveSessionMap(map);
-}
+// Removed getLatestSessionForChat and setLatestSessionForChat
+// Now only explicit Reply button clicks are accepted, no auto-guessing
 
 // Session locking system - prevents cross-session message stealing
 const REPLY_LOCK_FILE = path.join(USER_CFG_DIR, 'reply-lock.json');
@@ -1679,7 +1685,24 @@ async function hookPreToolUse() {
     console.log(`[${hookId}] Waiting for user response...`);
     console.log(`📱 [afk] Check your Telegram for Approve/Deny options (timeout: ${timeout}s)`);
     
-    const update = await distributedTelegramPoll(messageFilter, hookId, timeoutMs);
+    const update = await distributedTelegramPoll(messageFilter, hookId, sessionId, timeoutMs);
+    
+    // Check if polling was cancelled (mode switched to local)
+    if (update === null) {
+      eprint(`[${hookId}] Polling cancelled - proceeding with local permissions`);
+      // Return allow decision to let Claude continue with local permissions
+      const response = {
+        decision: 'allow',
+        reason: 'Switched to local mode',
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse',
+          permissionDecision: 'allow',
+          permissionDecisionReason: 'Switched to local mode - proceeding with normal permissions'
+        }
+      };
+      process.stdout.write(JSON.stringify(response));
+      return;
+    }
     
     if (update && update.callback_query) {
       const callbackData = update.callback_query.data || '';
@@ -2119,7 +2142,15 @@ async function hookStop() {
     console.log(`🛑 [afk] Stop hook waiting for user response...`);
     console.log(`📱 [afk] Check your Telegram for Reply/Finish options (timeout: ${timeout}s)`);
     
-    const update = await distributedTelegramPoll(messageFilter, hookId, timeout * 1000);
+    const update = await distributedTelegramPoll(messageFilter, hookId, sessionId, timeout * 1000);
+    
+    // Check if polling was cancelled (mode switched to local)
+    if (update === null) {
+      eprint(`[${hookId}] Polling cancelled - allowing Claude to finish normally`);
+      // Return empty JSON to allow Claude to stop normally
+      process.stdout.write(JSON.stringify({}));
+      return;
+    }
     
     if (update && update.callback_query) {
       const callbackData = update.callback_query.data || '';
@@ -2194,28 +2225,20 @@ async function hookStop() {
               return false;
             }
             
-            // Use session locking to prevent cross-session message stealing
+            // Only accept messages when explicitly waiting after Reply button
             if (!isMyMessage(sessionId, updateToCheck.message)) {
               return false;
             }
             
-            // Prefer replies to our specific message
-            if (updateToCheck.message.reply_to_message && 
-                updateToCheck.message.reply_to_message.message_id === waitingForReplyTo) {
-              eprint(`[${hookId}] Got reply to our specific message`);
-              clearReplyLock(); // Clear lock since we got the expected reply
-              return true;
-            }
-            
-            // Also accept general text messages if we own them via lock
-            eprint(`[${hookId}] Got text message for our session`);
-            clearReplyLock(); // Clear lock since we got a message
+            // We got a message and we own the lock - accept it
+            eprint(`[${hookId}] Got text message after Reply button click`);
+            clearReplyLock();
             return true;
           }
           return false;
         };
         
-        const textUpdate = await distributedTelegramPoll(textMessageFilter, hookId + '-text', timeout * 1000);
+        const textUpdate = await distributedTelegramPoll(textMessageFilter, hookId + '-text', sessionId, timeout * 1000);
         
         if (textUpdate && textUpdate.message && textUpdate.message.text) {
           const userText = textUpdate.message.text;
@@ -2442,7 +2465,15 @@ async function hookSessionStart() {
     console.log(`⏳ [afk] SessionStart hook waiting for user response...`);
     console.log(`📱 [afk] Check your Telegram for Reply/Continue options (timeout: ${timeout}s)`);
     
-    const update = await distributedTelegramPoll(messageFilter, hookId, timeout * 1000);
+    const update = await distributedTelegramPoll(messageFilter, hookId, sessionId, timeout * 1000);
+    
+    // Check if polling was cancelled (mode switched to local)
+    if (update === null) {
+      eprint(`[${hookId}] Polling cancelled - allowing session to start normally`);
+      // Return empty JSON to allow session to continue normally
+      process.stdout.write(JSON.stringify({}));
+      return;
+    }
     
     if (update && update.callback_query) {
       const callbackData = update.callback_query.data || '';
@@ -2552,7 +2583,7 @@ async function hookSessionStart() {
           return false;
         };
         
-        const textUpdate = await distributedTelegramPoll(textMessageFilter, hookId + '-text', timeout * 1000);
+        const textUpdate = await distributedTelegramPoll(textMessageFilter, hookId + '-text', sessionId, timeout * 1000);
         
         if (textUpdate && textUpdate.message && textUpdate.message.text) {
           const userText = textUpdate.message.text;
