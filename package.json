@@ -1,6 +1,6 @@
 {
   "name": "@probelabs/afk",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Remote control and approval system for Claude Code via Telegram",
   "bin": {
     "afk": "bin/afk"

@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2025-08-30
+
+### Added
+- **Heartbeat-based session expiration**: Sessions now actively report their status via heartbeats
+  - Heartbeat updates occur every second during polling
+  - Sessions marked as expired only when heartbeat stops (2 seconds timeout)
+  - Prevents false "expired" messages while hooks are actively waiting
+- **Automatic hook cancellation**: Hooks automatically exit when switching from remote to local mode
+  - No more hanging hooks when toggling modes
+  - Immediate response to mode changes
+
+### Changed
+- Session expiration detection now based on heartbeat instead of creation time
+- Removed auto-guessing for message routing - only explicit Reply button clicks accepted
+- Simplified message handling logic for better predictability
+
+### Fixed
+- Sessions no longer show as "expired" while actively waiting for approval
+- Mode switching now properly cancels all pending approval requests
+
 ## [0.2.0] - 2025-08-29
 
 ### Added
