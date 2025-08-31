@@ -1,6 +1,6 @@
 {
   "name": "@probelabs/afk",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Remote control and approval system for Claude Code via Telegram",
   "bin": {
     "afk": "bin/afk"
@@ -41,6 +41,8 @@
   "files": [
     "bin/**/*",
     "test/**/*",
+    "generate-and-read-diff.js",
+    "send-final-version.js",
     "README.md",
     "LICENSE",
     "CHANGELOG.md"
