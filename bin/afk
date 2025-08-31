@@ -1053,6 +1053,126 @@ async function sendTelegramMessage(text, reply_markup) {
   return result;
 }
 
+async function sendTelegramPhoto(imagePath, caption, reply_markup) {
+  const { telegram_chat_id: chat, telegram_bot_token: token } = cfg();
+  if (!token || !chat) {
+    debugLog('TELEGRAM_ERROR', 'Telegram not configured for photo', {
+      hasToken: !!token,
+      hasChatId: !!chat
+    });
+    throw new Error('Telegram not configured');
+  }
+
+  const fs = require('fs');
+  const https = require('https');
+  const path = require('path');
+
+  if (!fs.existsSync(imagePath)) {
+    throw new Error('Image file not found: ' + imagePath);
+  }
+
+  debugLog('TELEGRAM_PHOTO', 'Sending photo', {
+    imagePath: path.basename(imagePath),
+    captionLength: caption ? caption.length : 0,
+    hasKeyboard: !!reply_markup,
+    chatId: chat
+  });
+
+  // Create multipart form data manually
+  const boundary = '----AFK' + Math.random().toString(36).substring(2);
+  const imageData = fs.readFileSync(imagePath);
+  
+  const parts = [];
+  
+  // Add chat_id
+  parts.push(`--${boundary}\r\n`);
+  parts.push(`Content-Disposition: form-data; name="chat_id"\r\n\r\n`);
+  parts.push(`${chat}\r\n`);
+  
+  // Add caption if provided
+  if (caption) {
+    parts.push(`--${boundary}\r\n`);
+    parts.push(`Content-Disposition: form-data; name="caption"\r\n\r\n`);
+    parts.push(`${caption}\r\n`);
+  }
+
+  // Add reply_markup if provided
+  if (reply_markup) {
+    parts.push(`--${boundary}\r\n`);
+    parts.push(`Content-Disposition: form-data; name="reply_markup"\r\n\r\n`);
+    parts.push(`${JSON.stringify(reply_markup)}\r\n`);
+  }
+
+  // Add photo
+  parts.push(`--${boundary}\r\n`);
+  parts.push(`Content-Disposition: form-data; name="photo"; filename="diff.png"\r\n`);
+  parts.push(`Content-Type: image/png\r\n\r\n`);
+
+  // Combine text parts, add image data, and closing boundary
+  const formDataBuffer = Buffer.concat([
+    Buffer.from(parts.join('')),
+    imageData,
+    Buffer.from(`\r\n--${boundary}--\r\n`)
+  ]);
+
+  const options = {
+    hostname: 'api.telegram.org',
+    path: `/bot${token}/sendPhoto`,
+    method: 'POST',
+    headers: {
+      'Content-Type': `multipart/form-data; boundary=${boundary}`,
+      'Content-Length': formDataBuffer.length
+    },
+    timeout: 30000 // 30 second timeout for photo uploads
+  };
+
+  return new Promise((resolve, reject) => {
+    const req = https.request(options, res => {
+      let out = '';
+      res.on('data', c => out += c);
+      res.on('end', () => {
+        try {
+          const j = JSON.parse(out || '{}');
+          if (j.ok) {
+            debugLog('TELEGRAM_PHOTO', 'Photo sent successfully', {
+              messageId: j.result?.message_id,
+              chatId: j.result?.chat?.id
+            });
+            resolve(j.result);
+          } else {
+            debugLog('TELEGRAM_PHOTO_ERROR', 'Failed to send photo', {
+              error: j.description
+            });
+            reject(new Error(j.description || 'Telegram photo upload error'));
+          }
+        } catch (e) {
+          debugLog('TELEGRAM_PHOTO_ERROR', 'Failed to parse response', {
+            error: e.message,
+            response: out.substring(0, 200)
+          });
+          reject(new Error('Invalid response from Telegram'));
+        }
+      });
+    });
+
+    req.on('error', error => {
+      debugLog('TELEGRAM_PHOTO_ERROR', 'Network error sending photo', {
+        error: error.message
+      });
+      reject(error);
+    });
+
+    req.on('timeout', () => {
+      req.destroy();
+      debugLog('TELEGRAM_PHOTO_ERROR', 'Photo upload timeout');
+      reject(new Error('Photo upload timeout'));
+    });
+
+    req.write(formDataBuffer);
+    req.end();
+  });
+}
+
 // ---------------------------
 // Settings writer
 // ---------------------------
@@ -1562,6 +1682,19 @@ async function hookPreToolUse() {
   ensureDir(APPROVAL_DIR);
   const approvalFile = path.join(APPROVAL_DIR, approvalId);
   
+  // Generate preview diff image for Edit/MultiEdit/Write/NotebookEdit operations (only when approval is required)
+  let previewImagePath = null;
+  if (['Edit', 'MultiEdit', 'Write', 'NotebookEdit'].includes(toolName)) {
+    try {
+      previewImagePath = await generatePreviewDiffImage(toolName, toolInput, cwd);
+      if (previewImagePath) {
+        eprint(`[afk] Generated preview diff image for ${toolName} approval`);
+      }
+    } catch (previewError) {
+      eprint(`[afk] Failed to generate preview diff image: ${previewError.message}`);
+    }
+  }
+  
   // Prepare session tracking data (will be updated with message ID after sending)
   const toolCallSummary = `${toolName}${toolInput.command ? `(${toolInput.command})` : ''}`;
   const patterns = generatePermissionPattern(toolName, toolInput);
@@ -1589,20 +1722,55 @@ async function hookPreToolUse() {
     contextSection += `\n${intent}\n`;
   }
   
-  // Show recent conversation history
-  if (context.recentMessages && context.recentMessages.length > 1 && !context.error) {
+  // Show focused conversation history: last user message, AI response, and tool calls
+  if (context.recentMessages && context.recentMessages.length > 0 && !context.error) {
     contextSection += `\n💬 **Recent conversation:**`;
     
-    // Show last 3-4 messages to keep it manageable
-    const messagesToShow = context.recentMessages.slice(-4);
+    // Build base message without context to calculate remaining space (limit to 3800 chars)
+    const baseText = `🤖 *Approval required* — ${label}\n${summary}\n\n_Pattern${Array.isArray(patterns) ? 's' : ''}:_ \`${patternText}\`\n_Session:_ \`${shortSession(sessionId)}\`\n_Dir:_ \`${cwd}\``;
+    const baseWithIntent = baseText + (intent !== "No recent context available" ? `\n${intent}\n` : '');
+    const remainingChars = 3800 - baseWithIntent.length - contextSection.length - 50; // 3800 char limit with buffer
+    
+    // Show last 2-3 messages: user message, AI response, and tool calls
+    const messagesToShow = context.recentMessages.slice(-3);
+    let tempContext = '';
+    
     for (const msg of messagesToShow) {
       const roleIcon = msg.role === 'user' ? '👤' : '🤖';
-      // Don't trim messages - show full content
-      contextSection += `\n${roleIcon} ${msg.text}`;
+      let msgText = msg.text;
+      
+      // If this is a tool call message, enhance it with arguments
+      if (msg.role === 'assistant' && msgText.includes('[') && msgText.includes(']:')) {
+        // Try to extract and show tool arguments if available
+        const toolMatch = msgText.match(/\[([^:]+):\s*([^\]]+)\]/);
+        if (toolMatch) {
+          const [, toolName, args] = toolMatch;
+          msgText = msgText.replace(toolMatch[0], `[${toolName}: ${args}]`);
+        }
+      }
+      
+      const msgLine = `\n${roleIcon} ${msgText}`;
+      
+      // Check if we can fit this message
+      if ((tempContext + msgLine).length <= remainingChars) {
+        tempContext += msgLine;
+      } else {
+        // If it's the last AI message, always try to fit it (truncate if needed)
+        if (msg === messagesToShow[messagesToShow.length - 1] && msg.role === 'assistant') {
+          const availableSpace = remainingChars - tempContext.length - roleIcon.length - 2;
+          if (availableSpace > 100) {
+            const truncated = msgText.substring(0, availableSpace - 3) + '...';
+            tempContext += `\n${roleIcon} ${truncated}`;
+          }
+        }
+        break;
+      }
     }
+    
+    contextSection += tempContext;
   } else if (context.lastUserMessage && !context.error) {
-    const userText = context.lastUserMessage.text.substring(0, 100);
-    contextSection += `\n📝 **Last user:** "${userText}${userText.length >= 100 ? '...' : ''}"`;
+    const userText = context.lastUserMessage.text;
+    contextSection += `\n📝 **Last user:** "${userText}"`;
   }
   
   const text = `🤖 *Approval required* — ${label}\n${summary}${contextSection}\n\n_Pattern${Array.isArray(patterns) ? 's' : ''}:_ \`${patternText}\`\n_Session:_ \`${shortSession(sessionId)}\`\n_Dir:_ \`${cwd}\``;
@@ -1620,9 +1788,27 @@ async function hookPreToolUse() {
       { text: '🔧 Ask Claude UI', callback_data: `ask_ui:${approvalId}` }
     ]
   ] };
+  
   let msgRes = null;
   try {
-    msgRes = await sendTelegramMessage(text, keyboard);
+    if (previewImagePath) {
+      // Send approval request with preview diff image
+      try {
+        // Truncate text for caption (Telegram has 1024 char limit for photo captions)
+        let caption = text;
+        if (caption.length > 1000) {
+          caption = caption.substring(0, 997) + '...';
+        }
+        msgRes = await sendTelegramPhoto(previewImagePath, caption, keyboard);
+        eprint(`[afk] Sent approval request with preview diff image`);
+      } catch (photoError) {
+        eprint(`[afk] Failed to send preview image, falling back to text: ${photoError.message}`);
+        msgRes = await sendTelegramMessage(text, keyboard);
+      }
+    } else {
+      msgRes = await sendTelegramMessage(text, keyboard);
+    }
+    
     if (msgRes && msgRes.message_id && msgRes.chat) {
       // Track active session with message ID for abandoned session detection
       trackActiveSession(sessionId, toolCallSummary, {
@@ -1657,6 +1843,17 @@ async function hookPreToolUse() {
       cwd,
       patterns: Array.isArray(patterns) ? patterns : [patterns]
     });
+  }
+  
+  // Clean up temporary preview image after sending
+  if (previewImagePath) {
+    try {
+      const fs = require('fs');
+      fs.unlinkSync(previewImagePath);
+      eprint(`[afk] Cleaned up preview image: ${previewImagePath}`);
+    } catch (cleanupError) {
+      eprint(`[afk] Failed to cleanup preview image: ${cleanupError.message}`);
+    }
   }
 
   // Support infinite timeout with 0 or negative values
@@ -2015,6 +2212,667 @@ async function hookPreToolUse() {
 
 // Notification hook removed - redundant with PreToolUse
 
+// Function to generate and format git diff with syntax highlighting
+function generateFormattedDiff(cwd) {
+  try {
+    const { execSync } = require('child_process');
+    const diff = execSync('git diff', { cwd, encoding: 'utf8', maxBuffer: 50000 }).trim();
+    
+    if (!diff) {
+      return null; // No changes
+    }
+    
+    // Format diff with basic syntax highlighting for Telegram
+    const lines = diff.split('\n');
+    const formattedLines = [];
+    let inHunk = false;
+    
+    for (let line of lines) {
+      if (line.startsWith('diff --git')) {
+        formattedLines.push(`📁 ${line.replace('diff --git a/', '').replace(' b/', ' → ')}`);
+      } else if (line.startsWith('index ')) {
+        continue; // Skip index lines
+      } else if (line.startsWith('---') || line.startsWith('+++')) {
+        continue; // Skip file markers
+      } else if (line.startsWith('@@')) {
+        inHunk = true;
+        formattedLines.push(`🔍 ${line}`);
+      } else if (line.startsWith('+') && !line.startsWith('+++')) {
+        formattedLines.push(`➕ ${line.substring(1)}`);
+      } else if (line.startsWith('-') && !line.startsWith('---')) {
+        formattedLines.push(`➖ ${line.substring(1)}`);
+      } else if (inHunk && line.startsWith(' ')) {
+        formattedLines.push(`   ${line.substring(1)}`);
+      }
+    }
+    
+    return formattedLines.join('\n');
+  } catch (error) {
+    eprint(`[afk] Error generating diff: ${error.message}`);
+    return null;
+  }
+}
+
+// Function to generate preview diff image for proposed changes
+async function generatePreviewDiffImage(toolName, toolInput, cwd) {
+  try {
+    // Check if diff image generation is disabled
+    if (process.env.AFK_DISABLE_DIFF_IMAGES === 'true') {
+      eprint('[afk] Preview diff image generation disabled via AFK_DISABLE_DIFF_IMAGES');
+      return null;
+    }
+
+    // Only generate previews for file editing tools
+    if (!['Edit', 'MultiEdit', 'Write', 'NotebookEdit'].includes(toolName)) {
+      return null;
+    }
+
+    const fs = require('fs');
+    const path = require('path');
+    const os = require('os');
+
+    eprint(`[afk] Generating preview diff image for ${toolName} operation`);
+
+    let previewChanges = [];
+
+    if (toolName === 'Edit') {
+      // Single file edit
+      const filePath = toolInput.file_path;
+      const oldString = toolInput.old_string;
+      const newString = toolInput.new_string;
+      
+      if (!filePath || typeof filePath !== 'string' || 
+          oldString === undefined || typeof oldString !== 'string' ||
+          newString === undefined || typeof newString !== 'string') {
+        eprint(`[afk] Invalid Edit tool parameters: file_path=${!!filePath}, old_string=${oldString !== undefined}, new_string=${newString !== undefined}`);
+        return null;
+      }
+
+      const absolutePath = path.resolve(cwd, filePath);
+      
+      // Read current file content
+      let currentContent = '';
+      try {
+        if (fs.existsSync(absolutePath)) {
+          currentContent = fs.readFileSync(absolutePath, 'utf8');
+        }
+      } catch (e) {
+        eprint(`[afk] Could not read file for preview: ${e.message}`);
+        return null;
+      }
+
+      // Create preview of proposed change
+      const newContent = currentContent.replace(oldString, newString);
+      
+      previewChanges.push({
+        filePath: filePath,
+        currentContent,
+        newContent,
+        operation: 'modified'
+      });
+
+    } else if (toolName === 'MultiEdit') {
+      // Multiple edits in single file
+      const filePath = toolInput.file_path;
+      
+      if (!filePath || typeof filePath !== 'string' || 
+          !toolInput.edits || !Array.isArray(toolInput.edits) || toolInput.edits.length === 0) {
+        eprint(`[afk] Invalid MultiEdit tool parameters: file_path=${!!filePath}, edits=${Array.isArray(toolInput.edits)} (${toolInput.edits?.length || 0} items)`);
+        return null;
+      }
+      
+      // Validate each edit operation
+      for (let i = 0; i < toolInput.edits.length; i++) {
+        const edit = toolInput.edits[i];
+        if (!edit.old_string || typeof edit.old_string !== 'string' ||
+            edit.new_string === undefined || typeof edit.new_string !== 'string') {
+          eprint(`[afk] Invalid MultiEdit edit #${i + 1}: old_string=${!!edit.old_string}, new_string=${edit.new_string !== undefined}`);
+          return null;
+        }
+      }
+
+      const absolutePath = path.resolve(cwd, filePath);
+      
+      // Read current file content
+      let currentContent = '';
+      try {
+        if (fs.existsSync(absolutePath)) {
+          currentContent = fs.readFileSync(absolutePath, 'utf8');
+        }
+      } catch (e) {
+        eprint(`[afk] Could not read file for preview: ${e.message}`);
+        return null;
+      }
+
+      // Apply all edits to simulate the change
+      let newContent = currentContent;
+      for (const edit of toolInput.edits) {
+        if (edit.old_string && edit.new_string !== undefined) {
+          if (edit.replace_all) {
+            // Use global regex for replace_all functionality
+            const regex = new RegExp(edit.old_string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g');
+            newContent = newContent.replace(regex, edit.new_string);
+          } else {
+            newContent = newContent.replace(edit.old_string, edit.new_string);
+          }
+        }
+      }
+      
+      previewChanges.push({
+        filePath: filePath,
+        currentContent,
+        newContent,
+        operation: 'modified'
+      });
+
+    } else if (toolName === 'Write') {
+      // File write (create or overwrite)
+      const filePath = toolInput.file_path;
+      const newContent = toolInput.content;
+      
+      if (!filePath || typeof filePath !== 'string' || 
+          newContent === undefined || typeof newContent !== 'string') {
+        eprint(`[afk] Invalid Write tool parameters: file_path=${!!filePath}, content=${newContent !== undefined}`);
+        return null;
+      }
+
+      const absolutePath = path.resolve(cwd, filePath);
+      
+      // Read current file content if exists
+      let currentContent = '';
+      let operation = 'added';
+      
+      try {
+        if (fs.existsSync(absolutePath)) {
+          currentContent = fs.readFileSync(absolutePath, 'utf8');
+          operation = 'modified';
+        }
+      } catch (e) {
+        // File doesn't exist or can't be read - it's a new file
+      }
+      
+      previewChanges.push({
+        filePath: filePath,
+        currentContent,
+        newContent,
+        operation
+      });
+
+    } else if (toolName === 'NotebookEdit') {
+      // Notebook editing - handle cell modifications
+      const notebookPath = toolInput.notebook_path;
+      const newSource = toolInput.new_source;
+      const editMode = toolInput.edit_mode || 'replace';
+      const cellType = toolInput.cell_type;
+      
+      if (!notebookPath || typeof notebookPath !== 'string' || 
+          newSource === undefined || typeof newSource !== 'string') {
+        eprint(`[afk] Invalid NotebookEdit tool parameters: notebook_path=${!!notebookPath}, new_source=${newSource !== undefined}`);
+        return null;
+      }
+      
+      if (editMode && !['replace', 'insert', 'delete'].includes(editMode)) {
+        eprint(`[afk] Invalid NotebookEdit edit_mode: ${editMode} (must be replace, insert, or delete)`);
+        return null;
+      }
+      
+      if (cellType && !['code', 'markdown'].includes(cellType)) {
+        eprint(`[afk] Invalid NotebookEdit cell_type: ${cellType} (must be code or markdown)`);
+        return null;
+      }
+
+      const absolutePath = path.resolve(cwd, notebookPath);
+      
+      // Read current notebook content
+      let currentContent = '';
+      let operation = 'modified';
+      
+      try {
+        if (fs.existsSync(absolutePath)) {
+          const notebook = JSON.parse(fs.readFileSync(absolutePath, 'utf8'));
+          
+          // For preview purposes, convert notebook to a readable text format
+          currentContent = `# Notebook: ${notebookPath}\n\n`;
+          if (notebook.cells) {
+            notebook.cells.forEach((cell, index) => {
+              currentContent += `## Cell ${index + 1} (${cell.cell_type})\n`;
+              if (cell.source) {
+                const source = Array.isArray(cell.source) ? cell.source.join('') : cell.source;
+                currentContent += source + '\n\n';
+              }
+            });
+          }
+        } else {
+          operation = 'added';
+        }
+      } catch (e) {
+        eprint(`[afk] Could not read notebook for preview: ${e.message}`);
+        return null;
+      }
+
+      // Create preview of notebook changes
+      // For simplicity, we'll show the cell change as a text diff
+      const cellIdentifier = toolInput.cell_id ? `Cell ID: ${toolInput.cell_id}` : 
+                            toolInput.cell_number !== undefined ? `Cell ${toolInput.cell_number}` : 
+                            'New Cell';
+      
+      let newContent = currentContent;
+      if (editMode === 'insert') {
+        newContent += `\n## ${cellIdentifier} (NEW)\n${newSource}\n\n`;
+      } else if (editMode === 'delete') {
+        newContent = currentContent.replace(new RegExp(`## ${cellIdentifier}.*?\n\n`, 's'), '');
+      } else { // replace
+        // For replace mode, show a simplified diff
+        newContent = currentContent + `\n## ${cellIdentifier} (UPDATED)\n${newSource}\n\n`;
+      }
+      
+      previewChanges.push({
+        filePath: notebookPath,
+        currentContent,
+        newContent,
+        operation
+      });
+    }
+
+    if (previewChanges.length === 0) {
+      return null;
+    }
+
+    // Create temporary files with the changes to generate git diff
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'afk-preview-'));
+    const tempOriginalFile = path.join(tempDir, 'original.txt');
+    const tempModifiedFile = path.join(tempDir, 'modified.txt');
+    
+    let diffContent = '';
+
+    try {
+      for (const change of previewChanges) {
+        // Write temp files
+        fs.writeFileSync(tempOriginalFile, change.currentContent);
+        fs.writeFileSync(tempModifiedFile, change.newContent);
+        
+        // Generate git diff between temp files
+        const { execSync } = require('child_process');
+        
+        try {
+          const diff = execSync(
+            `git diff --no-index --no-prefix "${tempOriginalFile}" "${tempModifiedFile}"`,
+            { encoding: 'utf8', maxBuffer: 50000 }
+          ).trim();
+          
+          if (diff) {
+            // Replace temp file paths with actual file paths in diff
+            const cleanDiff = diff
+              .replace(/original\.txt/g, change.filePath)
+              .replace(/modified\.txt/g, change.filePath)
+              .replace(/a\//g, '')
+              .replace(/b\//g, '');
+            
+            diffContent += cleanDiff + '\n';
+          }
+        } catch (diffError) {
+          // git diff returns non-zero exit code when files differ, but that's normal
+          if (diffError.stdout) {
+            const cleanDiff = diffError.stdout
+              .replace(/original\.txt/g, change.filePath)
+              .replace(/modified\.txt/g, change.filePath)
+              .replace(/a\//g, '')
+              .replace(/b\//g, '');
+            
+            diffContent += cleanDiff + '\n';
+          }
+        }
+      }
+
+      if (!diffContent.trim()) {
+        return null;
+      }
+
+      // Use our beautiful diff image generation with the preview diff
+      return await generateBeautifulDiffFromContent(diffContent, 'Preview of Proposed Changes');
+
+    } finally {
+      // Clean up temp files
+      try {
+        fs.unlinkSync(tempOriginalFile);
+        fs.unlinkSync(tempModifiedFile);
+        fs.rmdirSync(tempDir);
+      } catch (e) {
+        // Ignore cleanup errors
+      }
+    }
+
+  } catch (error) {
+    eprint(`[afk] Error generating preview diff image: ${error.message}`);
+    return null;
+  }
+}
+
+// Helper function to generate beautiful diff image from diff content
+async function generateBeautifulDiffFromContent(diffContent, title = 'Preview of Proposed Changes') {
+  try {
+    // For now, create a temporary file with the diff content and use existing generate-and-read-diff.js
+    const fs = require('fs');
+    const path = require('path');
+    const os = require('os');
+    const { execSync } = require('child_process');
+
+    // Write diff content to a temporary location and use the existing generator
+    const tempFile = path.join(os.tmpdir(), `preview-diff-${Date.now()}.txt`);
+    fs.writeFileSync(tempFile, diffContent);
+    
+    // Use the existing generate-and-read-diff.js script with the diff content
+    const scriptPath = path.join(__dirname, 'generate-and-read-diff.js');
+    
+    try {
+      // Execute the generation script in a way that uses our diff content
+      const result = execSync(`echo '${diffContent.replace(/'/g, "\\'")}' | git apply --check --reverse 2>/dev/null || true && node "${scriptPath}"`, {
+        cwd: process.cwd(),
+        timeout: 30000,
+        maxBuffer: 100000
+      });
+      
+      // Check if the generated image exists
+      const imagePath = path.join(process.cwd(), 'generated-diff-image.png');
+      if (fs.existsSync(imagePath)) {
+        // Copy to temp location for preview
+        const previewPath = path.join(os.tmpdir(), `afk-preview-${Date.now()}.png`);
+        fs.copyFileSync(imagePath, previewPath);
+        eprint(`[afk] Preview diff image generated at ${previewPath}`);
+        return previewPath;
+      }
+    } catch (scriptError) {
+      eprint(`[afk] Error running diff generation script: ${scriptError.message}`);
+    } finally {
+      // Clean up temp file
+      try {
+        fs.unlinkSync(tempFile);
+      } catch (e) {
+        // Ignore cleanup error
+      }
+    }
+    
+    return null;
+
+  } catch (error) {
+    eprint(`[afk] Error generating beautiful preview diff: ${error.message}`);
+    return null;
+  }
+}
+
+// Function to generate diff image with syntax highlighting
+async function generateDiffImage(cwd) {
+  const timeoutPromise = new Promise((_, reject) => {
+    setTimeout(() => reject(new Error('Diff image generation timed out after 30 seconds')), 30000);
+  });
+
+  const generatePromise = async () => {
+    try {
+      // Check if diff image generation is disabled
+      if (process.env.AFK_DISABLE_DIFF_IMAGES === 'true') {
+        eprint('[afk] Diff image generation disabled via AFK_DISABLE_DIFF_IMAGES');
+        return null;
+      }
+
+      const { execSync } = require('child_process');
+      const fs = require('fs');
+      const path = require('path');
+      const os = require('os');
+
+      // Get git diff with size limits
+      const diff = execSync('git diff', { cwd, encoding: 'utf8', maxBuffer: 100000 }).trim();
+      
+      if (!diff) {
+        eprint('[afk] No git changes found, skipping diff image generation');
+        return null; // No changes
+      }
+
+      // Check diff size and truncate if too large
+      const maxDiffSize = 50000; // 50KB limit
+      let processedDiff = diff;
+      if (diff.length > maxDiffSize) {
+        eprint(`[afk] Diff too large (${diff.length} chars), truncating to ${maxDiffSize}`);
+        processedDiff = diff.substring(0, maxDiffSize) + '\n... (diff truncated for image generation)';
+      }
+
+      eprint(`[afk] Generating diff image for ${processedDiff.length} characters of changes`);
+
+      // Import diff2html (dynamic import for commonjs)
+      const { parse, html } = require('diff2html');
+      
+      // Parse and convert diff to HTML with side-by-side view but better styling
+      const diffJson = parse(processedDiff);
+      const htmlContent = html(diffJson, {
+        drawFileList: false,
+        matching: 'lines',
+        outputFormat: 'side-by-side', // Back to side-by-side but with better CSS
+        synchronisedScroll: false,
+        highlight: true,
+        renderNothingWhenEmpty: false
+      });
+
+    // Create compact side-by-side diff HTML optimized for Telegram
+    const fullHtml = `
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <style>
+        body { 
+            font-family: 'SF Mono', 'Monaco', 'Inconsolata', 'Fira Code', monospace; 
+            font-size: 11px; 
+            margin: 15px; 
+            background: #ffffff;
+            line-height: 1.4;
+            color: #24292e;
+            max-height: 2000px; /* Overall height limit */
+            overflow: hidden;
+        }
+        .d2h-wrapper { 
+            border: 1px solid #e1e4e8; 
+            border-radius: 8px; 
+            overflow: hidden;
+            margin-bottom: 16px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .d2h-file-header { 
+            background: #f1f8ff; 
+            border-bottom: 1px solid #c8e1ff; 
+            padding: 10px 16px; 
+            font-weight: 600;
+            font-size: 12px;
+            color: #0366d6;
+        }
+        .d2h-code-wrapper { 
+            overflow: visible;
+            max-height: 800px; /* Limit height per file */
+            overflow-y: hidden; /* Hide overflow instead of scroll */
+        }
+        .d2h-diff-table { 
+            width: 100%; 
+            border-collapse: collapse;
+            font-size: 11px;
+        }
+        .d2h-code-line-ctn { 
+            padding: 0 12px; 
+            line-height: 1.45;
+            position: relative;
+        }
+        .d2h-code-line { 
+            white-space: pre-wrap; 
+            word-wrap: break-word;
+            font-family: inherit;
+            display: inline-block;
+            width: calc(100% - 60px);
+            margin-left: 8px;
+        }
+        .d2h-ins { 
+            background-color: #e6ffed !important; 
+            border-left: 4px solid #28a745;
+        }
+        .d2h-ins .d2h-code-line {
+            background-color: rgba(40, 167, 69, 0.1);
+            padding: 2px 4px;
+            margin: 1px 0;
+        }
+        .d2h-del { 
+            background-color: #ffeef0 !important; 
+            border-left: 4px solid #d73a49;
+        }
+        .d2h-del .d2h-code-line {
+            background-color: rgba(215, 58, 73, 0.1);
+            padding: 2px 4px;
+            margin: 1px 0;
+        }
+        .d2h-cntx { 
+            background-color: #ffffff;
+            border-left: 4px solid #f1f1f1;
+        }
+        .d2h-line-number { 
+            background-color: #f8f9fa; 
+            color: #656d76; 
+            text-align: right; 
+            padding: 0 8px; 
+            border-right: 1px solid #e1e4e8; 
+            user-select: none;
+            font-size: 10px;
+            width: 50px;
+            vertical-align: top;
+            font-weight: 400;
+        }
+        /* Hide files after the 4th one to keep image manageable */
+        .d2h-file-wrapper:nth-child(n+5) {
+            display: none;
+        }
+        /* Add truncation indicator after 4th file */
+        .d2h-file-wrapper:nth-child(4)::after {
+            content: "⋮ Additional files not shown in image";
+            display: block;
+            text-align: center;
+            padding: 16px;
+            color: #666;
+            font-style: italic;
+            background: #f8f9fa;
+            border-top: 1px solid #e1e4e8;
+        }
+        /* Add visual indicators for add/remove */
+        .d2h-ins .d2h-line-number::before {
+            content: '+';
+            color: #28a745;
+            font-weight: bold;
+        }
+        .d2h-del .d2h-line-number::before {
+            content: '-';
+            color: #d73a49;
+            font-weight: bold;
+        }
+    </style>
+</head>
+<body>
+${htmlContent}
+</body>
+</html>`;
+
+    // Generate temporary file path
+    const tempDir = os.tmpdir();
+    const imagePath = path.join(tempDir, `afk-diff-${Date.now()}.png`);
+
+    // Import puppeteer-core
+    const puppeteer = require('puppeteer-core');
+    
+    // Try to find Chrome/Chromium executable
+    const chromiumPaths = [
+      '/usr/bin/google-chrome',
+      '/usr/bin/chromium-browser',
+      '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+      '/Applications/Chromium.app/Contents/MacOS/Chromium',
+      process.env.CHROME_EXECUTABLE_PATH
+    ].filter(Boolean);
+
+    let executablePath = null;
+    for (const chromePath of chromiumPaths) {
+      try {
+        if (fs.existsSync(chromePath)) {
+          executablePath = chromePath;
+          break;
+        }
+      } catch (e) {
+        // Continue to next path
+      }
+    }
+
+    if (!executablePath) {
+      eprint('[afk] No Chrome/Chromium executable found, falling back to text diff');
+      return null;
+    }
+
+    // Launch browser and take screenshot
+    const browser = await puppeteer.launch({
+      executablePath,
+      headless: true,
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-web-security']
+    });
+
+    try {
+      const page = await browser.newPage();
+      
+      // Set a reasonable viewport size for mobile-friendly viewing
+      await page.setViewport({ width: 1200, height: 800 });
+      
+      await page.setContent(fullHtml, { waitUntil: 'networkidle0' });
+      
+      // Get the actual content dimensions
+      const dimensions = await page.evaluate(() => {
+        const body = document.body;
+        const html = document.documentElement;
+        return {
+          width: Math.max(body.scrollWidth, body.offsetWidth, html.clientWidth, html.scrollWidth, html.offsetWidth),
+          height: Math.max(body.scrollHeight, body.offsetHeight, html.clientHeight, html.scrollHeight, html.offsetHeight)
+        };
+      });
+      
+      eprint(`[afk] Diff image dimensions: ${dimensions.width}x${dimensions.height}`);
+      
+      // Take screenshot with reasonable limits
+      await page.screenshot({
+        path: imagePath,
+        type: 'png',
+        fullPage: false, // Don't capture full page
+        clip: {
+          x: 0,
+          y: 0,
+          width: Math.min(dimensions.width, 1200), // Max 1200px width
+          height: Math.min(dimensions.height, 1600) // Max 1600px height for readability
+        }
+      });
+
+      return imagePath;
+    } finally {
+      await browser.close();
+    }
+
+    } catch (error) {
+      // Clean up any temporary files on error
+      if (imagePath && fs.existsSync(imagePath)) {
+        try {
+          fs.unlinkSync(imagePath);
+        } catch (cleanupError) {
+          eprint(`[afk] Failed to cleanup temp image on error: ${cleanupError.message}`);
+        }
+      }
+      throw error;
+    }
+  };
+
+  try {
+    // Race between the generation promise and timeout
+    return await Promise.race([generatePromise(), timeoutPromise]);
+  } catch (error) {
+    eprint(`[afk] Error generating diff image: ${error.message}`);
+    return null;
+  }
+}
+
 async function hookStop() {
   const data = await readStdinJson();
   const sessionId = data.session_id;
@@ -2060,25 +2918,73 @@ async function hookStop() {
   // Extract conversation context to show what the agent accomplished
   const context = extractConversationContext(data.transcript_path, 15);
   
-  // Build context section showing recent conversation
+  // Generate diff to show code changes made during session
+  const formattedDiff = generateFormattedDiff(cwd);
+  
+  // Generate diff image if changes exist
+  let diffImagePath = null;
+  if (formattedDiff) {
+    try {
+      diffImagePath = await generateDiffImage(cwd);
+      if (diffImagePath) {
+        eprint(`[afk] Generated diff image: ${diffImagePath}`);
+      }
+    } catch (error) {
+      eprint(`[afk] Failed to generate diff image: ${error.message}`);
+    }
+  }
+  
+  // Build focused context: last user message, AI response, and tool calls with arguments
   let contextSection = '';
   if (context.recentMessages && context.recentMessages.length > 0 && !context.error) {
     contextSection += `\n\n💬 **What happened:**`;
     
-    // Show last few messages but truncate to avoid Telegram's 4096 char limit
-    const messagesToShow = context.recentMessages.slice(-3); // Reduce from 5 to 3
+    // Build base message to calculate remaining space (limit to 3800 chars)
+    const baseText = `✅ *Agent finished* — ${label}\n\n_Session:_ \`${shortSession(sessionId)}\`\n\n**What next?**\n• Tap *Reply* to send a follow-up task\n• Tap *Finish* to close this session`;
+    const diffSection = formattedDiff ? `\n\n📝 **Code changes:**\n\`\`\`diff\n${formattedDiff}\n\`\`\`` : '';
+    const remainingChars = 3800 - baseText.length - contextSection.length - diffSection.length - 50; // 3800 char limit with buffer
+    
+    // Show last 2-3 messages: user request, AI response, and tool calls
+    const messagesToShow = context.recentMessages.slice(-3);
+    let tempContext = '';
+    
     for (const msg of messagesToShow) {
       const roleIcon = msg.role === 'user' ? '👤' : '🤖';
-      // Truncate individual messages to prevent overflow
-      const truncatedText = msg.text.length > 200 ? msg.text.substring(0, 200) + '...' : msg.text;
-      contextSection += `\n${roleIcon} ${truncatedText}`;
+      let msgText = msg.text;
+      
+      // Enhanced tool call display with arguments
+      if (msg.role === 'assistant' && msgText.includes('[') && msgText.includes(']:')) {
+        // Extract and enhance tool call information
+        const toolMatch = msgText.match(/\[([^:]+):\s*([^\]]+)\]/);
+        if (toolMatch) {
+          const [, toolName, args] = toolMatch;
+          // Show tool name and arguments more clearly
+          msgText = msgText.replace(toolMatch[0], `🔧 ${toolName}(${args})`);
+        }
+      }
+      
+      const msgLine = `\n${roleIcon} ${msgText}`;
+      
+      // Check if we can fit this message
+      if ((tempContext + msgLine).length <= remainingChars) {
+        tempContext += msgLine;
+      } else {
+        // Always prioritize the most recent AI completion message
+        if (msg === messagesToShow[messagesToShow.length - 1] && msg.role === 'assistant') {
+          const availableSpace = remainingChars - tempContext.length - roleIcon.length - 2;
+          if (availableSpace > 100) {
+            const truncated = msgText.substring(0, availableSpace - 3) + '...';
+            tempContext += `\n${roleIcon} ${truncated}`;
+          }
+        }
+        break;
+      }
     }
+    
+    contextSection += tempContext;
   } else if (context.lastAssistantMessage) {
-    // Truncate last assistant message
-    const truncatedText = context.lastAssistantMessage.text.length > 300 
-      ? context.lastAssistantMessage.text.substring(0, 300) + '...' 
-      : context.lastAssistantMessage.text;
-    contextSection += `\n\n🤖 **Last action:** ${truncatedText}`;
+    // Show last assistant message - prioritize showing complete response
+    contextSection += `\n\n🤖 **Last action:** ${context.lastAssistantMessage.text}`;
   }
   
   // Ensure total message doesn't exceed Telegram's limit
@@ -2099,7 +3005,24 @@ async function hookStop() {
   ]] };
   let msgRes = null;
   try {
-    msgRes = await sendTelegramMessage(text, keyboard);
+    // Send photo with diff if available, otherwise send text message
+    if (diffImagePath) {
+      try {
+        // Truncate text for caption (Telegram has 1024 char limit for photo captions)
+        let caption = text;
+        if (caption.length > 1000) {
+          caption = caption.substring(0, 997) + '...';
+        }
+        msgRes = await sendTelegramPhoto(diffImagePath, caption, keyboard);
+        eprint(`[afk] Sent stop notice with diff image`);
+      } catch (photoError) {
+        eprint(`[afk] Failed to send photo, falling back to text: ${photoError.message}`);
+        msgRes = await sendTelegramMessage(text, keyboard);
+      }
+    } else {
+      msgRes = await sendTelegramMessage(text, keyboard);
+    }
+    
     if (msgRes && msgRes.message_id && msgRes.chat) {
       rememberMessageMapping(msgRes.message_id, {
         kind: 'stop_notice',
@@ -2112,6 +3035,17 @@ async function hookStop() {
     }
   } catch (e) {
     eprint('[telegram] failed to send stop notice:', e.message);
+  } finally {
+    // Clean up temporary diff image if it was created
+    if (diffImagePath) {
+      try {
+        const fs = require('fs');
+        fs.unlinkSync(diffImagePath);
+        eprint(`[afk] Cleaned up diff image: ${diffImagePath}`);
+      } catch (cleanupError) {
+        eprint(`[afk] Failed to clean up diff image: ${cleanupError.message}`);
+      }
+    }
   }
 
   // Block and wait for user interaction, just like PreToolUse hook does

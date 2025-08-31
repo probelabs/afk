@@ -12,7 +12,7 @@ export default {
       
       // Remove /afk from the path and proxy to the Pages site
       const newPath = url.pathname.replace('/afk', '') || '/';
-      const pagesUrl = `https://33fced85.afk-site.pages.dev${newPath}${url.search}`;
+      const pagesUrl = `https://8201a0ad.afk-site.pages.dev${newPath}${url.search}`;
       
       // Fetch from the Pages deployment
       const response = await fetch(pagesUrl, {

@@ -50,6 +50,13 @@
   },
   "engines": {
     "node": ">=18"
+  },
+  "dependencies": {
+    "diff2html": "^3.4.52",
+    "imagemin": "^9.0.1",
+    "imagemin-pngquant": "^10.0.0",
+    "pngquant": "^4.2.0",
+    "puppeteer-core": "^23.9.0",
+    "sharp": "^0.34.3"
   }
 }
-
