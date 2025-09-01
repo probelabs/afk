@@ -881,9 +881,9 @@ function checkAbandonedSessions() {
       const lastActivity = new Date(session.lastActivity);
       const timeSinceActivity = (now - lastActivity) / 1000; // seconds
       
-      // Consider session abandoned if no heartbeat for 2 seconds
-      // (heartbeats occur every 1 second during polling)
-      const heartbeatTimeout = 2; // seconds - if no update for 2s, hook has likely exited
+      // Consider session abandoned if no heartbeat for 10 seconds
+      // (heartbeats occur every 1 second during polling, but may have delays)
+      const heartbeatTimeout = 10; // seconds - allow for network delays and processing time
       if (timeSinceActivity > heartbeatTimeout) {
         abandonedSessions.push({
           sessionId,
@@ -2600,273 +2600,59 @@ async function generateBeautifulDiffFromContent(diffContent, title = 'Preview of
   }
 }
 
-// Function to generate diff image with syntax highlighting
+// Function to generate diff image with syntax highlighting using beautiful generator
 async function generateDiffImage(cwd) {
-  const timeoutPromise = new Promise((_, reject) => {
-    setTimeout(() => reject(new Error('Diff image generation timed out after 30 seconds')), 30000);
-  });
-
-  const generatePromise = async () => {
-    try {
-      // Check if diff image generation is disabled
-      if (process.env.AFK_DISABLE_DIFF_IMAGES === 'true') {
-        eprint('[afk] Diff image generation disabled via AFK_DISABLE_DIFF_IMAGES');
-        return null;
-      }
-
-      const { execSync } = require('child_process');
-      const fs = require('fs');
-      const path = require('path');
-      const os = require('os');
-
-      // Get git diff with size limits
-      const diff = execSync('git diff', { cwd, encoding: 'utf8', maxBuffer: 100000 }).trim();
-      
-      if (!diff) {
-        eprint('[afk] No git changes found, skipping diff image generation');
-        return null; // No changes
-      }
-
-      // Check diff size and truncate if too large
-      const maxDiffSize = 50000; // 50KB limit
-      let processedDiff = diff;
-      if (diff.length > maxDiffSize) {
-        eprint(`[afk] Diff too large (${diff.length} chars), truncating to ${maxDiffSize}`);
-        processedDiff = diff.substring(0, maxDiffSize) + '\n... (diff truncated for image generation)';
-      }
-
-      eprint(`[afk] Generating diff image for ${processedDiff.length} characters of changes`);
-
-      // Import diff2html (dynamic import for commonjs)
-      const { parse, html } = require('diff2html');
-      
-      // Parse and convert diff to HTML with side-by-side view but better styling
-      const diffJson = parse(processedDiff);
-      const htmlContent = html(diffJson, {
-        drawFileList: false,
-        matching: 'lines',
-        outputFormat: 'side-by-side', // Back to side-by-side but with better CSS
-        synchronisedScroll: false,
-        highlight: true,
-        renderNothingWhenEmpty: false
-      });
-
-    // Create compact side-by-side diff HTML optimized for Telegram
-    const fullHtml = `
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-    <style>
-        body { 
-            font-family: 'SF Mono', 'Monaco', 'Inconsolata', 'Fira Code', monospace; 
-            font-size: 11px; 
-            margin: 15px; 
-            background: #ffffff;
-            line-height: 1.4;
-            color: #24292e;
-            max-height: 2000px; /* Overall height limit */
-            overflow: hidden;
-        }
-        .d2h-wrapper { 
-            border: 1px solid #e1e4e8; 
-            border-radius: 8px; 
-            overflow: hidden;
-            margin-bottom: 16px;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-        }
-        .d2h-file-header { 
-            background: #f1f8ff; 
-            border-bottom: 1px solid #c8e1ff; 
-            padding: 10px 16px; 
-            font-weight: 600;
-            font-size: 12px;
-            color: #0366d6;
-        }
-        .d2h-code-wrapper { 
-            overflow: visible;
-            max-height: 800px; /* Limit height per file */
-            overflow-y: hidden; /* Hide overflow instead of scroll */
-        }
-        .d2h-diff-table { 
-            width: 100%; 
-            border-collapse: collapse;
-            font-size: 11px;
-        }
-        .d2h-code-line-ctn { 
-            padding: 0 12px; 
-            line-height: 1.45;
-            position: relative;
-        }
-        .d2h-code-line { 
-            white-space: pre-wrap; 
-            word-wrap: break-word;
-            font-family: inherit;
-            display: inline-block;
-            width: calc(100% - 60px);
-            margin-left: 8px;
-        }
-        .d2h-ins { 
-            background-color: #e6ffed !important; 
-            border-left: 4px solid #28a745;
-        }
-        .d2h-ins .d2h-code-line {
-            background-color: rgba(40, 167, 69, 0.1);
-            padding: 2px 4px;
-            margin: 1px 0;
-        }
-        .d2h-del { 
-            background-color: #ffeef0 !important; 
-            border-left: 4px solid #d73a49;
-        }
-        .d2h-del .d2h-code-line {
-            background-color: rgba(215, 58, 73, 0.1);
-            padding: 2px 4px;
-            margin: 1px 0;
-        }
-        .d2h-cntx { 
-            background-color: #ffffff;
-            border-left: 4px solid #f1f1f1;
-        }
-        .d2h-line-number { 
-            background-color: #f8f9fa; 
-            color: #656d76; 
-            text-align: right; 
-            padding: 0 8px; 
-            border-right: 1px solid #e1e4e8; 
-            user-select: none;
-            font-size: 10px;
-            width: 50px;
-            vertical-align: top;
-            font-weight: 400;
-        }
-        /* Hide files after the 4th one to keep image manageable */
-        .d2h-file-wrapper:nth-child(n+5) {
-            display: none;
-        }
-        /* Add truncation indicator after 4th file */
-        .d2h-file-wrapper:nth-child(4)::after {
-            content: "⋮ Additional files not shown in image";
-            display: block;
-            text-align: center;
-            padding: 16px;
-            color: #666;
-            font-style: italic;
-            background: #f8f9fa;
-            border-top: 1px solid #e1e4e8;
-        }
-        /* Add visual indicators for add/remove */
-        .d2h-ins .d2h-line-number::before {
-            content: '+';
-            color: #28a745;
-            font-weight: bold;
-        }
-        .d2h-del .d2h-line-number::before {
-            content: '-';
-            color: #d73a49;
-            font-weight: bold;
-        }
-    </style>
-</head>
-<body>
-${htmlContent}
-</body>
-</html>`;
-
-    // Generate temporary file path
-    const tempDir = os.tmpdir();
-    const imagePath = path.join(tempDir, `afk-diff-${Date.now()}.png`);
-
-    // Import puppeteer-core
-    const puppeteer = require('puppeteer-core');
-    
-    // Try to find Chrome/Chromium executable
-    const chromiumPaths = [
-      '/usr/bin/google-chrome',
-      '/usr/bin/chromium-browser',
-      '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-      '/Applications/Chromium.app/Contents/MacOS/Chromium',
-      process.env.CHROME_EXECUTABLE_PATH
-    ].filter(Boolean);
-
-    let executablePath = null;
-    for (const chromePath of chromiumPaths) {
-      try {
-        if (fs.existsSync(chromePath)) {
-          executablePath = chromePath;
-          break;
-        }
-      } catch (e) {
-        // Continue to next path
-      }
-    }
-
-    if (!executablePath) {
-      eprint('[afk] No Chrome/Chromium executable found, falling back to text diff');
+  try {
+    // Check if diff image generation is disabled
+    if (process.env.AFK_DISABLE_DIFF_IMAGES === 'true') {
+      eprint('[afk] Diff image generation disabled via AFK_DISABLE_DIFF_IMAGES');
       return null;
     }
 
-    // Launch browser and take screenshot
-    const browser = await puppeteer.launch({
-      executablePath,
-      headless: true,
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-web-security']
+    const { execSync } = require('child_process');
+    const fs = require('fs');
+    const path = require('path');
+
+    // Check if there are any git changes
+    const diff = execSync('git diff', { cwd, encoding: 'utf8', maxBuffer: 100000 }).trim();
+    if (!diff) {
+      eprint('[afk] No git changes found, skipping diff image generation');
+      return null;
+    }
+
+    eprint('[afk] Generating beautiful diff image using generate-and-read-diff.js');
+
+    // Get the directory where the afk binary is located  
+    const afkDir = path.dirname(require.main.filename);
+    const generatorScript = path.join(afkDir, '..', 'generate-and-read-diff.js');
+    
+    // Fallback: try current working directory if script not found
+    const fallbackScript = path.join(cwd, 'generate-and-read-diff.js');
+    const scriptPath = fs.existsSync(generatorScript) ? generatorScript : fallbackScript;
+    
+    if (!fs.existsSync(scriptPath)) {
+      eprint(`[afk] generate-and-read-diff.js not found at ${scriptPath}, using fallback method`);
+      return null;
+    }
+
+    // Run the beautiful diff generator
+    execSync(`node "${scriptPath}"`, { 
+      cwd, 
+      stdio: 'inherit',
+      timeout: 30000
     });
 
-    try {
-      const page = await browser.newPage();
-      
-      // Set a reasonable viewport size for mobile-friendly viewing
-      await page.setViewport({ width: 1200, height: 800 });
-      
-      await page.setContent(fullHtml, { waitUntil: 'networkidle0' });
-      
-      // Get the actual content dimensions
-      const dimensions = await page.evaluate(() => {
-        const body = document.body;
-        const html = document.documentElement;
-        return {
-          width: Math.max(body.scrollWidth, body.offsetWidth, html.clientWidth, html.scrollWidth, html.offsetWidth),
-          height: Math.max(body.scrollHeight, body.offsetHeight, html.clientHeight, html.scrollHeight, html.offsetHeight)
-        };
-      });
-      
-      eprint(`[afk] Diff image dimensions: ${dimensions.width}x${dimensions.height}`);
-      
-      // Take screenshot with reasonable limits
-      await page.screenshot({
-        path: imagePath,
-        type: 'png',
-        fullPage: false, // Don't capture full page
-        clip: {
-          x: 0,
-          y: 0,
-          width: Math.min(dimensions.width, 1200), // Max 1200px width
-          height: Math.min(dimensions.height, 1600) // Max 1600px height for readability
-        }
-      });
-
+    // Check if the image was generated
+    const imagePath = path.join(cwd, 'generated-diff-image.png');
+    if (fs.existsSync(imagePath)) {
+      const stats = fs.statSync(imagePath);
+      eprint(`[afk] Generated beautiful diff image: ${imagePath} (${(stats.size / 1024).toFixed(1)} KB)`);
       return imagePath;
-    } finally {
-      await browser.close();
+    } else {
+      eprint('[afk] Diff image generation completed but no image file found');
+      return null;
     }
 
-    } catch (error) {
-      // Clean up any temporary files on error
-      if (imagePath && fs.existsSync(imagePath)) {
-        try {
-          fs.unlinkSync(imagePath);
-        } catch (cleanupError) {
-          eprint(`[afk] Failed to cleanup temp image on error: ${cleanupError.message}`);
-        }
-      }
-      throw error;
-    }
-  };
-
-  try {
-    // Race between the generation promise and timeout
-    return await Promise.race([generatePromise(), timeoutPromise]);
   } catch (error) {
     eprint(`[afk] Error generating diff image: ${error.message}`);
     return null;
