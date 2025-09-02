@@ -8,6 +8,11 @@ const path = require('path');
 const https = require('https');
 const { spawnSync } = require('child_process');
 
+// Core modules
+const { cfg, writeDefaultConfig, loadJson, saveJson } = require('../lib/core/config');
+const { isDebugEnabled, debugLog, eprint } = require('../lib/core/logger');
+const { ensureDir, ensureExecutable, toPosix, cryptoRandomId, escapeMarkdown } = require('../lib/core/utils');
+
 // ---------------------------
 // Constants & paths
 // ---------------------------
@@ -33,64 +38,16 @@ const ACTIVE_SESSIONS_FILE = path.join(USER_CFG_DIR, 'active-sessions.json');
 // ---------------------------
 // Debug logging
 // ---------------------------
-function isDebugEnabled() {
-  // Check persistent debug setting
-  const debugFile = path.join(USER_CFG_DIR, '.debug');
-  if (fs.existsSync(debugFile)) return true;
-  
-  // Check environment variable
-  if (process.env.AFK_DEBUG === '1' || process.env.CC_REMOTE_DEBUG === '1') {
-    if (process.env.CC_REMOTE_DEBUG === '1') {
-      eprint('[afk] Warning: CC_REMOTE_DEBUG is deprecated, use AFK_DEBUG instead');
-    }
-    return true;
-  }
-  
-  // Check command line flag
-  if (process.argv.includes('--debug')) return true;
-  
-  return false;
-}
+// isDebugEnabled function moved to lib/core/logger.js
 
 const DEBUG_MODE = isDebugEnabled();
 
-function debugLog(category, message, data = null) {
-  if (!DEBUG_MODE) return;
-  
-  const timestamp = new Date().toISOString();
-  const logEntry = {
-    timestamp,
-    category,
-    message,
-    data,
-    pid: process.pid,
-    mode: readMode(),
-    session: process.env.CLAUDE_SESSION_ID || 'unknown'
-  };
-  
-  // Log to stderr for immediate visibility
-  const logLine = `[DEBUG ${timestamp}] [${category}] ${message}`;
-  if (data) {
-    eprint(logLine, JSON.stringify(data, null, 2));
-  } else {
-    eprint(logLine);
-  }
-  
-  // Also append to debug log file
-  try {
-    ensureDir(USER_CFG_DIR);
-    fs.appendFileSync(DEBUG_LOG_FILE, JSON.stringify(logEntry) + '\n');
-  } catch (e) {
-    // Silent fail - don't break the app if logging fails
-  }
-}
+// debugLog function moved to lib/core/logger.js
 
 // ---------------------------
 // Utilities
 // ---------------------------
-function eprint(...args) { console.error(...args); }
-
-function ensureDir(p) { fs.mkdirSync(p, { recursive: true }); }
+// eprint and ensureDir functions moved to lib/core/logger.js and lib/core/utils.js
 
 // ---------------------------  
 // Global message queue system
@@ -305,19 +262,7 @@ async function distributedTelegramPoll(filterFn, hookId, sessionId, timeoutMs = 
   throw new Error(`[${hookId}] Polling timeout after ${timeoutMs}ms`);
 }
 
-function loadJson(p, def) {
-  try {
-    if (fs.existsSync(p)) return JSON.parse(fs.readFileSync(p, 'utf8'));
-  } catch (e) { eprint(`[afk] Failed to read ${p}: ${e.message}`); }
-  return def;
-}
-
-function saveJson(p, obj) {
-  ensureDir(path.dirname(p));
-  const tmp = p + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify(obj, null, 2));
-  fs.renameSync(tmp, p);
-}
+// loadJson and saveJson functions moved to lib/core/config.js
 
 // Parse compound bash commands into individual commands
 function parseCompoundCommand(command) {
@@ -660,14 +605,7 @@ function addPermissionToSettings(pattern, cwd) {
   return false;
 }
 
-function ensureExecutable(p) {
-  try {
-    const st = fs.statSync(p);
-    fs.chmodSync(p, st.mode | 0o111);
-  } catch (_) {}
-}
-
-function toPosix(p) { return p.split(path.sep).join('/'); }
+// ensureExecutable and toPosix functions moved to lib/core/utils.js
 
 function readMode() {
   if (fs.existsSync(STATE_FILE)) {
@@ -682,22 +620,11 @@ function writeMode(mode) {
   fs.writeFileSync(STATE_FILE, mode);
 }
 
-function cfg() {
-  const c = loadJson(USER_CFG, {});
-  c.telegram_bot_token ||= process.env.TELEGRAM_BOT_TOKEN || '';
-  c.telegram_chat_id ||= process.env.TELEGRAM_CHAT_ID || '';
-  c.timeout_seconds ||= DEFAULT_TIMEOUT;
-  c.timeout_action ||= DEFAULT_TIMEOUT_ACTION; // What to do on timeout: 'deny', 'allow', or 'wait'
-  c.intercept_matcher ||= 'Bash|Edit|Write|MultiEdit|WebFetch|mcp__.*';
-  c.auto_approve_tools ||= ['Read'];
-  return c;
-}
+// cfg function moved to lib/core/config.js
 
-function writeDefaultConfig() {
-  if (!fs.existsSync(USER_CFG)) {
-    saveJson(USER_CFG, cfg());
-    console.log(`Wrote default config at ${USER_CFG}`);
-  }
+// writeDefaultConfig function moved to lib/core/config.js
+function writeDefaultConfigExtended() {
+  writeDefaultConfig();
   ensureDir(USER_CFG_DIR);
   ensureDir(APPROVAL_DIR);
   // Ensure history files exist
@@ -787,14 +714,7 @@ function isInstalled() {
 // ---------------------------
 // Markdown escaping for Telegram
 // ---------------------------
-function escapeMarkdown(text) {
-  if (typeof text !== 'string') return text;
-  // Escape special Markdown characters for Telegram
-  // Order matters: escape backslashes first
-  return text
-    .replace(/\\/g, '\\\\')
-    .replace(/([_*\[\]()~`>#+\-=|{}.!])/g, '\\$1');
-}
+// escapeMarkdown function moved to lib/core/utils.js
 
 // ---------------------------
 // Session tracking
@@ -3418,12 +3338,7 @@ function modeCmd(sub) {
 // ---------------------------
 // Helpers
 // ---------------------------
-function cryptoRandomId() {
-  // Simple UUID-ish (without importing crypto)
-  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
-    const r = Math.random()*16|0; const v = c === 'x' ? r : (r&0x3|0x8); return v.toString(16);
-  });
-}
+// cryptoRandomId function moved to lib/core/utils.js
 
 // ---------------------------
 // CLI
@@ -3464,7 +3379,7 @@ function printHelp() {
 }
 
 async function main() {
-  writeDefaultConfig();
+  writeDefaultConfigExtended();
   const argv = process.argv.slice(2);
   const cmd = argv[0];
   
