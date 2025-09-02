@@ -9,7 +9,7 @@
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-0-blue.svg)](package.json)
 [![npm version](https://img.shields.io/npm/v/@probelabs/afk.svg)](https://www.npmjs.com/package/@probelabs/afk)
 
-> **Your code doesn't stop when you leave your desk.** Get Telegram notifications for Claude Code actions and approve them from anywhere. No cloud dependencies, no third-party servers.
+> **Your code doesn't stop when you leave your desk.** Get Telegram notifications for Claude Code actions and approve them from anywhere. No cloud dependencies, no third-party servers. **Plus**: Integrate any AI system with remote approval using simple binary calls.
 
 ## ⚡ Quick Start
 
@@ -40,6 +40,12 @@ afk        # Smart toggle: installs hooks and enables remote mode
 - 🏖️ Monitor critical tasks remotely
 - 🔒 Add approval gates for sensitive operations
 
+**🤖 Universal AI Integration**
+- Not just Claude Code—works with any AI system
+- Simple binary calls (Python, Node.js, bash, etc.)
+- [Complete integration guide](INTEGRATION.md) with examples
+- Risk assessment and approval policies
+
 **🔐 Privacy First**
 - Zero cloud dependencies
 - Direct Telegram connection
@@ -62,6 +68,18 @@ afk off          # Disable remote approvals
 afk status       # Check current mode
 ```
 
+### Claude Commands
+Control AFK mode directly from Claude Code interface:
+```bash
+/afk             # Toggle global AFK mode
+/afk:on          # Enable remote mode globally
+/afk:off         # Disable remote mode globally
+/afk:status      # Show current mode status
+/afk:global      # Toggle global mode (same as /afk)
+/afk:project     # Toggle project-specific mode
+/afk:help        # Show command help
+```
+
 ### Setup & Installation
 ```bash
 afk setup        # Interactive Telegram bot setup
@@ -73,6 +91,35 @@ afk uninstall    # Remove hooks
 ```bash
 afk telegram test    # Test Telegram connection
 afk debug on         # Enable debug logging
+```
+
+## 🤖 AI Integration
+
+**Want to integrate AFK with your own AI system?** Check out our [comprehensive integration guide](INTEGRATION.md) with examples for:
+
+- 🐍 **Python**: Simple AFKIntegration class with subprocess calls
+- 🚀 **Node.js**: Promise-based integration with error handling  
+- 🔧 **Bash**: Pure shell script integration with JSON piping
+- 🎯 **Generic Template**: Complete framework with risk assessment
+
+**Quick Example (Python):**
+```python
+from afk_integration import AFKIntegration
+
+afk = AFKIntegration("my-ai-session")
+if afk.request_approval("execute_code", {"code": "print('Hello!')", "language": "python"}):
+    exec("print('Hello!')")  # User approved - execute
+else:
+    print("User denied code execution")
+```
+
+**Setup Integration Examples:**
+```bash
+# Run the setup script to install AFK and configure examples
+bash scripts/setup-integration.sh
+
+# Test all integration examples
+bash scripts/test-integration.sh
 ```
 
 ## 🔧 How it Works
@@ -322,4 +369,4 @@ MIT License - Part of the [Probe Labs](https://probelabs.com) ecosystem
 
 ## 🔗 Links
 
-📖 [Documentation](https://probelabs.com/afk) • 🐛 [Issues](https://github.com/probelabs/afk/issues) • 💬 [Discussions](https://github.com/probelabs/afk/discussions)
+📖 [Documentation](https://probelabs.com/afk) • 🤖 [AI Integration Guide](INTEGRATION.md) • 🐛 [Issues](https://github.com/probelabs/afk/issues) • 💬 [Discussions](https://github.com/probelabs/afk/discussions)

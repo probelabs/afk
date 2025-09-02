@@ -1,0 +1,17 @@
+{
+  "name": "afk-nodejs-agent",
+  "version": "1.0.0",
+  "description": "Node.js AI Agent with AFK Integration Example",
+  "main": "ai-agent.js",
+  "scripts": {
+    "start": "node ai-agent.js",
+    "demo": "node ai-agent.js"
+  },
+  "keywords": ["ai", "agent", "afk", "remote", "approval", "telegram"],
+  "author": "AFK Integration Example",
+  "license": "MIT",
+  "engines": {
+    "node": ">=14.0.0"
+  },
+  "dependencies": {}
+}

@@ -866,8 +866,8 @@
                         Documentation
                         <span>→</span>
                     </a>
-                    <a href="#install" class="btn btn-secondary">
-                        Get Started
+                    <a href="https://github.com/probelabs/afk/blob/main/INTEGRATION.md" class="btn btn-secondary">
+                        AI Integration Guide
                     </a>
                 </div>
             </div>
@@ -1013,11 +1013,11 @@
                 </div>
                 
                 <div class="feature">
-                    <span class="feature-icon">🔄</span>
-                    <h3>Multi-Session Routing</h3>
+                    <span class="feature-icon">🤖</span>
+                    <h3>Universal AI Integration</h3>
                     <p>
-                        Manage multiple Claude projects simultaneously. Messages intelligently 
-                        route to the correct session based on context.
+                        Not just for Claude Code—integrate any AI system with remote approval. 
+                        Simple binary calls work with Python, Node.js, bash, and more.
                     </p>
                 </div>
             </div>
@@ -1055,6 +1055,34 @@
                 <span class="code-line code-line-animated-bottom"><span class="code-success">✓ AFK mode deactivated</span></span>
                 <span class="code-line code-line-animated-bottom"><span class="code-success">→ Control returned to local Claude</span></span>
                 </div>
+                
+                <h3 style="font-size: 1.25rem; margin: 2.5rem 0 1.5rem; color: var(--text-primary);">🎯 Two Ways to Control</h3>
+                
+                <div style="display: flex; gap: 2rem; margin-bottom: 1.5rem;">
+                    <div style="flex: 1; padding: 1.5rem; background: #f8f9fa; border-radius: 12px; border: 1px solid #e5e7eb;">
+                        <h4 style="margin: 0 0 1rem; color: var(--text-primary); font-size: 1rem;">📱 CLI Commands (Terminal)</h4>
+                        <div style="font-family: 'SF Mono', Monaco, monospace; font-size: 0.875rem; line-height: 1.5; color: var(--text-secondary);">
+                            afk&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span style="color: var(--text-muted);"># Toggle global mode</span><br>
+                            afk on&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span style="color: var(--text-muted);"># Enable remote mode</span><br>
+                            afk off&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span style="color: var(--text-muted);"># Disable remote mode</span><br>
+                            afk status&nbsp;&nbsp;<span style="color: var(--text-muted);"># Check current mode</span>
+                        </div>
+                    </div>
+                    
+                    <div style="flex: 1; padding: 1.5rem; background: #f0f7ff; border-radius: 12px; border: 1px solid #c7d8ed;">
+                        <h4 style="margin: 0 0 1rem; color: var(--text-primary); font-size: 1rem;">⚡ Claude Commands (Built-in)</h4>
+                        <div style="font-family: 'SF Mono', Monaco, monospace; font-size: 0.875rem; line-height: 1.5; color: var(--text-secondary);">
+                            /afk&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span style="color: var(--text-muted);"># Toggle global mode</span><br>
+                            /afk:on&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span style="color: var(--text-muted);"># Enable remote mode</span><br>
+                            /afk:off&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span style="color: var(--text-muted);"># Disable remote mode</span><br>
+                            /afk:project&nbsp;<span style="color: var(--text-muted);"># Toggle project mode</span>
+                        </div>
+                    </div>
+                </div>
+                
+                <p style="color: var(--text-secondary); font-size: 0.9375rem; text-align: center; margin-bottom: 1.5rem;">
+                    <strong>Pro tip:</strong> Use Claude commands to control AFK mode directly from your conversation without leaving the interface.
+                </p>
             </div>
             
             <div class="button-group" style="justify-content: center; margin-top: 3rem;">
@@ -1062,8 +1090,8 @@
                     View on GitHub
                     <span>→</span>
                 </a>
-                <a href="https://www.npmjs.com/package/@probelabs/afk" class="btn btn-secondary">
-                    npm Package
+                <a href="https://github.com/probelabs/afk/blob/main/INTEGRATION.md" class="btn btn-secondary">
+                    AI Integration Guide
                 </a>
             </div>
         </div>
@@ -1086,7 +1114,8 @@
                         <p>
                             AFK is part of the Probe ecosystem—tools dedicated to improving human and AI collaboration 
                             in development. While Probe helps AI understand code context, AFK ensures you maintain 
-                            control over AI actions through remote approval workflows, keeping humans in the loop wherever they are.
+                            control over AI actions through remote approval workflows. Integrate with any AI system 
+                            using simple binary calls—Python, Node.js, bash, or your custom agent.
                         </p>
                         <a href="https://probelabs.com" class="probe-link">
                             Explore Probe Ecosystem
