@@ -1,7 +1,7 @@
 {
   "name": "@probelabs/afk",
   "version": "0.5.0",
-  "description": "Remote control and approval system for Claude Code via Telegram",
+  "description": "Universal AI integration platform: Remote approval for any AI system via Telegram. Supports Python, Node.js, bash and more.",
   "bin": {
     "afk": "bin/afk"
   },
@@ -39,7 +39,7 @@
   "bugs": {
     "url": "https://github.com/probelabs/afk/issues"
   },
-  "homepage": "https://github.com/probelabs/afk#readme",
+  "homepage": "https://afk-site.pages.dev",
   "keywords": [
     "claude",
     "claude-code",
@@ -48,14 +48,24 @@
     "remote-control",
     "approval",
     "afk",
-    "cli"
+    "cli",
+    "ai-integration",
+    "universal-ai",
+    "python-ai",
+    "nodejs-ai",
+    "bash-integration",
+    "subprocess"
   ],
   "files": [
     "bin/**/*",
+    "lib/**/*",
+    "examples/**/*",
+    "scripts/**/*",
     "test/**/*",
     "generate-and-read-diff.js",
     "send-final-version.js",
     "README.md",
+    "INTEGRATION.md",
     "LICENSE",
     "CHANGELOG.md"
   ],
