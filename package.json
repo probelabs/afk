@@ -1,6 +1,6 @@
 {
   "name": "@probelabs/afk",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Universal AI integration platform: Remote approval for any AI system via Telegram. Supports Python, Node.js, bash and more.",
   "bin": {
     "afk": "bin/afk"

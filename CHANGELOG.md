@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2025-01-09
+
+### Added
+- **Read-Only Mode**: New operating mode for passive monitoring without workflow interference
+  - Enable with `afk readonly` command or `/afk:readonly` slash command
+  - Sends notifications for completed sessions without blocking or waiting for responses
+  - Perfect for monitoring long-running tasks without delays
+  - Operates independently from local/remote toggle cycle
+- **Enhanced Mode Management**: Three distinct operating modes with clear purposes
+  - **Local Mode**: Default Claude behavior with built-in prompts
+  - **Remote Mode**: Full Telegram approval workflow with interactive buttons
+  - **Read-Only Mode**: Passive notifications without intervention
+- **Improved Toggle Behavior**: Toggle command now cycles only between local and remote modes
+  - Read-only mode requires explicit activation via dedicated command
+  - Maintains predictable toggle behavior while adding monitoring capability
+- **Updated CLI and Slash Commands**: Full support for read-only mode
+  - New `afk readonly` CLI command
+  - New `/afk:readonly` slash command for Claude Code interface
+  - Updated help documentation and command descriptions
+
+### Changed
+- Toggle behavior now cycles between local ↔ remote only (read-only is separate)
+- Updated notification formatting to clearly indicate read-only mode with special prefixes
+- Enhanced help text and documentation to explain all three operating modes
+- Improved mode status display with tips for switching between all modes
+
+### Fixed
+- Resolved Utils class instantiation issue causing cryptoRandomId function errors
+- PreToolUse hook now correctly handles read-only mode without intervention
+
 ## [0.4.0] - 2025-08-30
 
 ### Added

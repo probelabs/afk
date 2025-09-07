@@ -65,15 +65,17 @@ afk        # Smart toggle: installs hooks and enables remote mode
 afk              # Smart toggle: install if needed, then toggle mode
 afk on           # Enable remote approvals  
 afk off          # Disable remote approvals
+afk readonly     # Enable read-only mode (notifications without blocking)
 afk status       # Check current mode
 ```
 
 ### Claude Commands
 Control AFK mode directly from Claude Code interface:
 ```bash
-/afk             # Toggle global AFK mode
+/afk             # Toggle global AFK mode (local ↔ remote)
 /afk:on          # Enable remote mode globally
 /afk:off         # Disable remote mode globally
+/afk:readonly    # Enable read-only mode globally
 /afk:status      # Show current mode status
 /afk:global      # Toggle global mode (same as /afk)
 /afk:project     # Toggle project-specific mode
@@ -92,6 +94,33 @@ afk uninstall    # Remove hooks
 afk telegram test    # Test Telegram connection
 afk debug on         # Enable debug logging
 ```
+
+## 🎛️ Operating Modes
+
+AFK supports three operating modes to fit different workflows:
+
+### 🔒 Remote Mode (`afk on`)
+- **Full approval workflow**: All permissioned tools require Telegram approval
+- **Interactive**: Tap Approve/Deny buttons for each action
+- **Blocking**: Claude waits for your response before proceeding
+- **Best for**: Active development when you want full control
+
+### 🏠 Local Mode (`afk off`) 
+- **Default Claude behavior**: Uses Claude's built-in permission prompts
+- **No Telegram notifications**: Everything happens in Claude interface
+- **Non-blocking**: Normal Claude workflow
+- **Best for**: When working directly at your computer
+
+### 📖 Read-Only Mode (`afk readonly`)
+- **Passive monitoring**: Get notified of completed sessions
+- **No approvals required**: Tools execute without intervention
+- **Non-blocking**: No delays or waiting
+- **Best for**: Monitoring long-running tasks without interference
+
+**Mode Toggle Behavior:**
+- `afk` or `afk toggle`: Cycles between Local ↔ Remote only
+- `afk readonly`: Explicit command to enable read-only mode
+- Read-only mode is separate and doesn't interfere with normal toggling
 
 ## 🤖 AI Integration
 
@@ -135,17 +164,19 @@ AFK hooks into Claude Code at key decision points:
 - Auto-approves safe tools like `Read` and `Grep`
 - Creates permanent patterns from one-time approvals
 
-**3. Mobile Approval Flow**
+**3. Mode-Based Workflow**
 ```
 Claude wants to edit file.js
         ↓
-AFK checks: Local or Remote mode?
+AFK checks current mode:
         ↓
-Sends Telegram notification with context
+Local Mode: Claude handles normally
+Remote Mode: Send approval request → Wait for response
+Read-Only Mode: Allow execution, notify on completion
         ↓
-You tap: [Approve] [Deny] [Allow All] [Ask Claude UI]
+You tap: [Approve] [Deny] [Allow All] [Ask Claude UI] (Remote only)
         ↓
-Claude proceeds or stops based on your choice
+Claude proceeds based on mode and your choice
 ```
 
 **4. Session Management**
