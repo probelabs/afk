@@ -70,6 +70,12 @@ run_test_suite "diff generation tests" "node test/test-diff-generation.js"
 run_test_suite "session management tests" "node test/test-session-management.js"
 run_test_suite "preview diff generation tests" "node test/test-preview-diff.js"
 run_test_suite "Telegram integration tests" "node test/test-telegram-integration.js"
+run_test_suite "AFK command parsing tests" "node test/test-afk-command-parsing.js"
+
+# New comprehensive test suites for catching the issues we fixed
+run_test_suite "service integration tests" "node test/test-service-integration.js"
+run_test_suite "stderr pollution and error handling tests" "node test/test-stderr-and-error-handling.js"
+run_test_suite "service initialization tests" "node test/test-service-initialization.js"
 
 # Skip hook integration tests temporarily (they currently have failures)
 echo "Skipping hook integration tests (8 failures - to be fixed separately)..."
