@@ -21,11 +21,14 @@ jobs:
       uses: actions/setup-node@v4
       with:
         node-version: ${{ matrix.node-version }}
-        cache: 'npm'
     
-    - name: Install dependencies
-      run: npm ci
-      continue-on-error: true  # Allow to continue if no package-lock.json
+    - name: Install dependencies (if package.json exists)
+      run: |
+        if [ -f "package.json" ]; then
+          npm install
+        else
+          echo "No package.json found, skipping npm install"
+        fi
     
     - name: Create test environment
       run: |
