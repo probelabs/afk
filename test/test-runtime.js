@@ -139,6 +139,18 @@ async function testFunctionDefinitions() {
     definedFunctions.add(name);
   });
   
+  // Add imported functions from require statements
+  const requireImports = afkSource.match(/const\s*{\s*([^}]+)\s*}\s*=\s*require\(/g) || [];
+  requireImports.forEach(importStmt => {
+    const match = importStmt.match(/const\s*{\s*([^}]+)\s*}/);
+    if (match) {
+      const imports = match[1].split(',').map(s => s.trim());
+      imports.forEach(importName => {
+        definedFunctions.add(importName);
+      });
+    }
+  });
+  
   // Add Node.js built-ins and known globals
   const builtins = new Set([
     'require', 'process', 'console', 'setTimeout', 'clearTimeout',
